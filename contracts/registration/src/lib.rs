@@ -84,7 +84,7 @@ impl RegistrationContract {
     // -------------------------------------------------------------------------
 
     /// Register a new player profile at Level 0 (Unverified).
-    /// `ipfs_hashes` — list of IPFS/Arweave CIDs for highlight reels and photos.
+    /// `ipfs_hashes` - list of IPFS/Arweave CIDs for highlight reels and photos.
     pub fn register_player(
         env: Env,
         wallet: Address,
@@ -442,34 +442,7 @@ impl RegistrationContract {
     }
 
     fn level_gte(level: &ProgressLevel, min_level: &ProgressLevel) -> bool {
-        matches!(
-            (level, min_level),
-            (ProgressLevel::Unverified, ProgressLevel::Unverified)
-                | (ProgressLevel::VerifiedIdentity, ProgressLevel::Unverified)
-                | (
-                    ProgressLevel::PerformanceMilestones,
-                    ProgressLevel::Unverified
-                )
-                | (ProgressLevel::EliteTier, ProgressLevel::Unverified)
-                | (
-                    ProgressLevel::VerifiedIdentity,
-                    ProgressLevel::VerifiedIdentity
-                )
-                | (
-                    ProgressLevel::PerformanceMilestones,
-                    ProgressLevel::VerifiedIdentity
-                )
-                | (ProgressLevel::EliteTier, ProgressLevel::VerifiedIdentity)
-                | (
-                    ProgressLevel::PerformanceMilestones,
-                    ProgressLevel::PerformanceMilestones
-                )
-                | (
-                    ProgressLevel::EliteTier,
-                    ProgressLevel::PerformanceMilestones
-                )
-                | (ProgressLevel::EliteTier, ProgressLevel::EliteTier)
-        )
+        level.rank() >= min_level.rank()
     }
 }
 
@@ -923,6 +896,30 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(0).unwrap().player_id, 1);
+    }
+
+    #[test]
+    fn test_level_filter_uses_progress_level_ordering() {
+        assert!(RegistrationContract::level_gte(
+            &ProgressLevel::EliteTier,
+            &ProgressLevel::Unverified
+        ));
+        assert!(RegistrationContract::level_gte(
+            &ProgressLevel::EliteTier,
+            &ProgressLevel::PerformanceMilestones
+        ));
+        assert!(RegistrationContract::level_gte(
+            &ProgressLevel::PerformanceMilestones,
+            &ProgressLevel::VerifiedIdentity
+        ));
+        assert!(!RegistrationContract::level_gte(
+            &ProgressLevel::VerifiedIdentity,
+            &ProgressLevel::PerformanceMilestones
+        ));
+        assert!(!RegistrationContract::level_gte(
+            &ProgressLevel::Unverified,
+            &ProgressLevel::EliteTier
+        ));
     }
 
     // -------------------------------------------------------------------------
