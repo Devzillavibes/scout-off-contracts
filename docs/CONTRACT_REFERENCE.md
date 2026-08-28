@@ -2407,13 +2407,19 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 #### `get_level(player_id: u64) -> ProgressLevel`
 
 Return the player's current progress level. Returns `Unverified` for unknown
-player IDs (no `PlayerNotFound` error).
+player IDs (no `PlayerNotFound` error) — a **default-on-absent** getter.
 
 Reading is a keep-alive: when a `PlayerLevel` record exists, `get_level` extends
 its TTL so a dormant player's level is not lost to archival decay. The extension
 is skipped when no record exists — extending the TTL of an unwritten key raises
 `Storage/MissingValue`, which the host escalates to a panic, so an unguarded
 extension would make the documented `Unverified` default trap instead of return.
+
+The `Unverified` default is indistinguishable from a player genuinely stuck at
+the base tier, so this getter alone cannot assert a player's existence. To
+confirm a player exists, check the registration contract
+(`registration.get_player(player_id)`, which returns `PlayerNotFound` for an
+unknown ID) rather than reading it off the level.
 
 | | |
 |---|---|
@@ -2429,12 +2435,21 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 
 #### `get_history_count(player_id: u64) -> u32`
 
-Return the total number of history entries recorded for a player.
+Return the total number of history entries recorded for a player. **Returns `0`
+on absent storage — for a registered player with no recorded level changes and
+for an *unknown* `player_id` alike — with no error (default-on-absent).**
+
+There is no distinct empty-vs-missing signal: a `0` cannot tell you whether the
+player exists. Do not use this getter to assert existence; confirm the player
+against the registration contract (`registration.get_player(player_id)`, which
+returns `PlayerNotFound` for an unknown ID) and only then treat a `0` here as
+"no history entries." See [`docs/INDEXER.md`](INDEXER.md) for how the
+`player_level_history` reconciliation cross-check relies on this disambiguation.
 
 | | |
 |---|---|
 | **Auth** | None |
-| **Errors** | None |
+| **Errors** | None — returns the `0` default on absent storage |
 
 ```bash
 stellar contract invoke --id $PROGRESS_CONTRACT_ID \
@@ -2449,6 +2464,11 @@ Read a specific history entry. Indices start at `1`. Each `ProgressEntry`
 includes `updated_at` in Unix seconds and `ledger_sequence: u32`, the Soroban
 ledger sequence number at the time of the change (not a timestamp), for
 tamper-proof auditability.
+
+Unlike the count / list getters above, this one is **not** default-on-absent:
+an out-of-range `index` (including any index on an unknown player, so `0`
+entries) fails with `PlayerNotFound` rather than returning a zero value. This
+makes it the only progress getter that can itself reject an unknown player.
 
 | | |
 |---|---|
@@ -2469,7 +2489,11 @@ stores the full logical history as bounded `HistoryPage(player_id, page_index)`
 shards (fixed-size pages, not one ever-growing `HistoryVec` key) and
 reconstructs the chronological list at read time. This keeps per-entry storage
 cost bounded even if a player experiences many resets or repeated re-entries.
-Returns an empty `Vec` for unknown player IDs.
+Returns an empty `Vec` for unknown player IDs (default-on-absent, no error).
+Because an empty result is returned both for a registered player with no history
+and for an unknown `player_id`, verify existence against the registration
+contract (`registration.get_player(player_id)`) before interpreting the empty
+list, and distinguish "no level changes" from "player unknown" via that call.
 
 **Gas trade-off**: each page is a small, fixed-size `Vec<ProgressEntry>`, so the
 read cost scales with the number of pages touched rather than the total lifetime
@@ -2639,7 +2663,7 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 
 #### `get_progress_history_page(player_id: u64, offset: u32, limit: u32) -> Vec<ProgressEntry>`
 
-Paginated history retrieval. Returns entries starting at `offset+1`. `limit` is clamped to the range 1 through 50. Returns an empty `Vec` when `offset` >= total count.
+Paginated history retrieval. Returns entries starting at `offset+1`. `limit` is clamped to the range 1 through 50. Returns an empty `Vec` when `offset` >= total count, **and also returns an empty `Vec` for an unknown `player_id` (default-on-absent, no error)** — an unknown player has a count of `0`, so `offset` is always `>= count`. An empty result therefore does not by itself prove the player exists; confirm existence against the registration contract (`registration.get_player(player_id)`).
 
 | | |
 |---|---|
@@ -2658,6 +2682,12 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 Return all of a player's history entries with `updated_at >= since_timestamp`
 (Unix seconds). Useful for indexers polling for changes since their last sync
 point instead of re-reading the full history.
+
+Returns an empty `Vec` for an unknown `player_id` (default-on-absent, no error)
+— the same empty result a registered player with no matching entries yields —
+so this getter does not assert existence. Confirm the player against the
+registration contract (`registration.get_player(player_id)`) when the empty
+result's cause matters.
 
 | | |
 |---|---|

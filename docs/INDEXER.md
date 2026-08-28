@@ -37,6 +37,24 @@ explicitly (it prints them under "Skipped" rather than silently omitting
 them) and, for `player_level_history`, cross-checks the per-player row count
 against `progress.get_history_count` as a cheap drift signal.
 
+> **Why passing on a distinct empty-vs-missing signal is fine here.**
+> `get_history_count` is a *default-on-absent* getter (see
+> [`docs/CONTRACT_REFERENCE.md`](CONTRACT_REFERENCE.md#get_history_countplayer_id-u64---u32)):
+> it returns `0` both for a registered player with no recorded level changes
+> and for a `player_id` that does not exist on the progress contract, with no
+> error to tell them apart. For the reconciliation cross-check the ambiguity
+> is harmless because existence is disambiguated elsewhere in the same run:
+> this loop only iterates players already present in the `player_level_history`
+> rows *and* the `players` reconciliation (same sweep) diffs each one against
+> `registration.get_player`, reporting a `PlayerNotFound` existence mismatch
+> for any row whose player is absent on-chain. Once a player is confirmed to
+> exist via the registration contract, a `0` from `get_history_count` means
+> exactly "no level changes," which is the only comparison the cross-check
+> needs. A distinct `get_history_count` signal (e.g. returning `None` for an
+> unknown ID) would only be worth the added complexity if the cross-check ever
+> ran in isolation without the registration-contract existence check — it
+> currently does not.
+
 - ~~`scouts.verified`~~ — column added in migration `001_initial_schema.sql`
 - ~~Player deactivation status~~ — column added in migration `001_initial_schema.sql`
 - ~~Milestone pending-re-review flags~~ — `milestone_flags` and `revocation_records` tables added in migration `005_milestone_flags.sql` (issue #1039)
