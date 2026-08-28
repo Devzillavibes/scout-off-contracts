@@ -682,6 +682,10 @@ Each contract defines its own error enum. The same numeric code can mean differe
 | `fees_withdrawn` | Admin withdraws accumulated platform fees |
 | `admin_transfer_proposed` | Current admin proposes a replacement address |
 | `admin_transferred` | Pending admin accepts control |
+| `dispute_vote_cast` | A validator casts a vote on a jury-required milestone dispute |
+| `dispute_tallied` | A jury dispute is closed with a final verdict (upheld or overturned) |
+| `evidence_access_granted` | An `EvidenceAccessGrant` is issued to a scout via `pay_to_contact` / `batch_contact_players` |
+| `evidence_access_revoked` | Admin revokes a scout's `EvidenceAccessGrant` via `admin_revoke_evidence_access` |
 
 ## Why Stellar
 
