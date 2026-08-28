@@ -4157,7 +4157,10 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
 Return subscriptions whose `expires_at` is at or before `before_timestamp`.
 This query uses a day-granularity expiry bucket index to avoid scanning every
 subscription, and it filters renewals by re-checking the live stored
-`Subscription.expires_at`.
+`Subscription.expires_at`. The bucket scan starts at the earliest populated
+bucket day (`DataKey::MinExpiryBucketDay`, tracked by `subscribe`/seeding), so
+its cost tracks the number of populated expiry days in range rather than the
+number of days elapsed since the epoch.
 
 | | |
 |---|---|
