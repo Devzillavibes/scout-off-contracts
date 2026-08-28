@@ -241,6 +241,14 @@ impl ProgressContract {
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
 
         let old_level = Self::get_current_level(&env, player_id);
+        
+        // Validate that target_level < current_level (true rollback, not same-level or forward jump)
+        let old_code = Self::level_code(&old_level);
+        let target_code = Self::level_code(&target_level);
+        if target_code >= old_code {
+            return Err(ProgressError::InvalidProgressTransition);
+        }
+        
         Self::record_progress_entry(
             &env,
             player_id,
@@ -2178,6 +2186,72 @@ mod tests {
         let (env, client, _) = setup();
         env.mock_auths(&[]);
         client.reset_player_level(&1u64, &ProgressLevel::Unverified);
+    }
+
+    #[test]
+    fn test_reset_player_level_rejects_same_level() {
+        let (_, client, validator) = setup();
+        let player_id = 1u64;
+
+        // Advance to level 2 (PerformanceMilestones)
+        client.advance_level(&validator, &player_id, &1u32);
+        client.advance_level(&validator, &player_id, &2u32);
+        assert_eq!(client.get_level(&player_id), ProgressLevel::PerformanceMilestones);
+
+        // Attempt to reset to the same level — should fail
+        let result = client.try_reset_player_level(&player_id, &ProgressLevel::PerformanceMilestones);
+        assert_eq!(result, Err(Ok(ProgressError::InvalidProgressTransition)));
+        
+        // Level should remain unchanged
+        assert_eq!(client.get_level(&player_id), ProgressLevel::PerformanceMilestones);
+        // History should have only the 2 advances, no reset entry
+        assert_eq!(client.get_history_count(&player_id), 2);
+    }
+
+    #[test]
+    fn test_reset_player_level_rejects_forward_jump() {
+        let (_, client, validator) = setup();
+        let player_id = 1u64;
+
+        // Advance to level 1 (VerifiedIdentity)
+        client.advance_level(&validator, &player_id, &1u32);
+        assert_eq!(client.get_level(&player_id), ProgressLevel::VerifiedIdentity);
+
+        // Attempt to reset forward to level 3 (EliteTier) — should fail
+        let result = client.try_reset_player_level(&player_id, &ProgressLevel::EliteTier);
+        assert_eq!(result, Err(Ok(ProgressError::InvalidProgressTransition)));
+        
+        // Level should remain at 1, not jump to 3
+        assert_eq!(client.get_level(&player_id), ProgressLevel::VerifiedIdentity);
+        // History should have only the 1 advance, no reset entry
+        assert_eq!(client.get_history_count(&player_id), 1);
+    }
+
+    #[test]
+    fn test_reset_player_level_allows_valid_rollback() {
+        let (_, client, validator) = setup();
+        let player_id = 1u64;
+
+        // Advance to level 3 (EliteTier)
+        client.advance_level(&validator, &player_id, &1u32);
+        client.advance_level(&validator, &player_id, &2u32);
+        client.advance_level(&validator, &player_id, &3u32);
+        assert_eq!(client.get_level(&player_id), ProgressLevel::EliteTier);
+        assert_eq!(client.get_history_count(&player_id), 3);
+
+        // Reset down to level 1 (VerifiedIdentity) — should succeed
+        let result = client.try_reset_player_level(&player_id, &ProgressLevel::VerifiedIdentity);
+        assert_eq!(result, Ok(Ok(())));
+        
+        // Level should now be 1
+        assert_eq!(client.get_level(&player_id), ProgressLevel::VerifiedIdentity);
+        // History should have 3 advances + 1 reset entry
+        assert_eq!(client.get_history_count(&player_id), 4);
+        
+        let reset_entry = client.get_history_entry(&player_id, &4u32);
+        assert_eq!(reset_entry.old_level, ProgressLevel::EliteTier);
+        assert_eq!(reset_entry.new_level, ProgressLevel::VerifiedIdentity);
+        assert_eq!(reset_entry.milestone_ref, 0);
     }
 
     #[test]
