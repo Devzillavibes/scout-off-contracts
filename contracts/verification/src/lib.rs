@@ -490,6 +490,11 @@ impl VerificationContract {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
 
+        // Per-wallet cooldown: reject rapid re-registration attempts of the
+        // same wallet. Mirrors register_player/register_scout in the
+        // registration contract.
+        Self::enforce_reg_cooldown(&env, &DataKey::ValidatorRegLastSent(wallet.clone()))?;
+
         if credentials.len() > MAX_CREDENTIALS_LEN {
             return Err(VerificationError::InvalidInput);
         }
@@ -1048,6 +1053,10 @@ impl VerificationContract {
         // First pass: validate each entry without mutating state.
         for i in 0..entries.len() {
             let (wallet, credentials, affiliation, specializations) = entries.get(i).unwrap();
+
+            // Per-wallet cooldown, same as register_validator.
+            Self::enforce_reg_cooldown(&env, &DataKey::ValidatorRegLastSent(wallet.clone()))?;
+
             if affiliation.len() > MAX_CREDENTIALS_LEN {
                 return Err(VerificationError::InvalidInput);
             }
@@ -3665,7 +3674,6 @@ impl VerificationContract {
     /// timestamp is present and the current ledger time is before
     /// `last_sent + cooldown_secs`, returns `RegistrationCooldown`.
     /// A cooldown of 0 disables the check entirely.
-    #[allow(dead_code)]
     fn enforce_reg_cooldown(env: &Env, last_sent_key: &DataKey) -> Result<(), VerificationError> {
         let cooldown_secs: u64 = env
             .storage()
