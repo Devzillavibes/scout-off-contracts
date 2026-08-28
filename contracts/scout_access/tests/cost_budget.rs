@@ -23,6 +23,14 @@ use soroban_sdk::{
 const SUBSCRIBE_CPU_BUDGET: u64 = 597_410;
 const PAY_TO_CONTACT_CPU_BUDGET: u64 = 777_109;
 const BATCH_CONTACT_PLAYERS_CPU_BUDGET: u64 = 1_545_146;
+// #1042: for get_expiring_subscriptions we deliberately place the populated
+// expiry buckets ~50,000 days past epoch. A scan that starts at day 0 would
+// have to step through ~50,000 empty buckets and blow past any reasonable
+// budget; starting at MinExpiryBucketDay touches only the ~20 populated days.
+// Budget is estimated pending calibration (see note in PR); it sits far above
+// the optimized O(populated-buckets) cost while staying far below what a
+// day-0 scan would cost, so a regression is still caught.
+const GET_EXPIRING_SUBSCRIPTIONS_CPU_BUDGET: u64 = 1_500_000;
 // #795: expire_trial_offers is capped at 20 escrows/call — see
 // EXPIRE_TRIAL_OFFERS_MAX_LIMIT in contracts/scout_access/src/lib.rs.
 const EXPIRE_TRIAL_OFFERS_CPU_BUDGET: u64 = 8_614_029;
@@ -163,5 +171,41 @@ fn cost_get_player_access_grants_at_1000_grants() {
         &env,
         "get_player_access_grants(1000 total, page of 50)",
         GET_PLAYER_ACCESS_GRANTS_CPU_BUDGET,
+    );
+}
+
+/// Guards the bucket-scan starting point of `get_expiring_subscriptions`: the
+/// query must start at the minimum populated bucket day (`MinExpiryBucketDay`)
+/// rather than at day 0. The populated buckets are created ~50,000 days past
+/// the epoch, so if the implementation ever regressed to a day-0 scan it would
+/// step through ~50,000 empty day buckets and cost orders of magnitude more
+/// than the budget below allows.
+#[test]
+fn cost_get_expiring_subscriptions() {
+    let (env, client, xlm) = setup();
+    const SECS_PER_DAY: u64 = 86_400;
+
+    // Start the ledger well past epoch and give each scout its own expiry day
+    // so the populated buckets are spread across a range of large day indices.
+    let base_day = 50_000u64;
+    env.ledger().with_mut(|l| l.timestamp = base_day * SECS_PER_DAY);
+    for _ in 0u32..20u32 {
+        let scout = Address::generate(&env);
+        fund(&env, &xlm, &scout);
+        client.subscribe(&scout, &SubscriptionTier::Pro);
+        // Advance so the next scout's 30-day expiry lands on a distinct day.
+        env.ledger().with_mut(|l| l.timestamp += SECS_PER_DAY + 1);
+    }
+
+    // before_timestamp comfortably past the last scout's expiry (~base + 50 days).
+    let before_timestamp = (base_day + 60) * SECS_PER_DAY;
+
+    env.cost_estimate().budget().reset_default();
+    let expiring = client.get_expiring_subscriptions(&before_timestamp, &50u32);
+    assert_eq!(expiring.len(), 20);
+    assert_cpu_budget(
+        &env,
+        "get_expiring_subscriptions(20 scouts, buckets ~50k days from epoch)",
+        GET_EXPIRING_SUBSCRIPTIONS_CPU_BUDGET,
     );
 }

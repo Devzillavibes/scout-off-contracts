@@ -128,6 +128,7 @@ This document defines the persistent storage TTL policy for the scout-off-contra
 | `ConfirmationNonce(nonce)` | 518,400 | Idempotency marker for `confirm_trial_offer` retries. Extended on `confirm_trial_offer` write. |
 | `AutoRenew(scout)` | 518,400 | Scout auto-renewal opt-in flag. Extended on `set_auto_renew` write and `get_auto_renew` read. |
 | `ExpiryBucket(day)` | 518,400 | Day-granularity subscription expiry index for pagination. Extended in `add_to_expiry_bucket` write. |
+| `MinExpiryBucketDay` | Instance | Earliest populated expiry-bucket day. Lowered in `add_to_expiry_bucket` (and seeding); lets `get_expiring_subscriptions` start its bucket scan here instead of at day 0. 
 
 **Keep-Alive Mechanism:**
 - Instance keys (`Initialized`, `Paused`, `FeeConfig`, `AccumulatedFees`, `XlmToken`, `FeeConfigHistory`) are bumped on every state-modifying contract entry point via `bump_instance_ttl`.

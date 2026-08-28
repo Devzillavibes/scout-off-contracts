@@ -1819,10 +1819,13 @@ impl ScoutAccessContract {
     ///
     /// Uses the day-granularity `ExpiryBucket` index populated by `subscribe` to
     /// avoid a full linear scan of all subscribers.  Only buckets whose day key
-    /// falls within `[0, before_timestamp / 86_400]` are examined.  The index
-    /// covers all days from epoch 0 up to the given cutoff, so the scan is bounded
-    /// by the number of distinct expiry days in that range, not the total number
-    /// of scouts.
+    /// falls within `[start_day, before_timestamp / 86_400]` are examined, where
+    /// `start_day` is the minimum populated bucket day (`DataKey::MinExpiryBucketDay`)
+    /// tracked by `add_to_expiry_bucket`.  Because no bucket is ever populated
+    /// before that day, the scan is bounded by the number of distinct populated
+    /// expiry days in range, not the number of days since epoch — in particular it
+    /// does not waste instructions stepping through the (usually empty) day buckets
+    /// between epoch 0 and the first real subscription.
     ///
     /// **Index tradeoff**: day-bucket granularity is chosen over exact expiry-time
     /// indexing to keep per-`subscribe` storage cost low.  Each bucket entry is
@@ -1850,10 +1853,16 @@ impl ScoutAccessContract {
 
         let mut results: soroban_sdk::Vec<Subscription> = soroban_sdk::Vec::new(&env);
 
-        // Walk day buckets from day 0 up to cutoff_day (inclusive).
-        // In practice, epoch-0 buckets are never populated; the loop starts
-        // effectively at the earliest real subscription day.
-        let mut day = 0u64;
+        // Walk day buckets from the earliest populated bucket day up to
+        // cutoff_day (inclusive). Skipping the (usually empty) day buckets
+        // before MinExpiryBucketDay keeps this O(populated days), not
+        // O(elapsed days since epoch).
+        let start_day: u64 = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::MinExpiryBucketDay)
+            .unwrap_or(0);
+        let mut day = start_day;
         while day <= cutoff_day && results.len() < effective_limit {
             let bucket_key = DataKey::ExpiryBucket(day);
             if let Some(scouts) = env
@@ -2291,6 +2300,7 @@ impl ScoutAccessContract {
                 .persistent()
                 .extend_ttl(&eb_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
         }
+        Self::track_min_expiry_bucket_day(&env, bucket);
 
         Ok(())
     }
@@ -2679,6 +2689,25 @@ impl ScoutAccessContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        Self::track_min_expiry_bucket_day(env, day);
+    }
+
+    /// Record the earliest populated expiry-bucket day so
+    /// `get_expiring_subscriptions` can start its bucket scan there instead of
+    /// at day 0. Only ever lowers the stored value (monotonic minimum), so it
+    /// remains a safe lower bound even after a bucket later empties via
+    /// `remove_from_expiry_bucket`.
+    fn track_min_expiry_bucket_day(env: &Env, day: u64) {
+        let current: u64 = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::MinExpiryBucketDay)
+            .unwrap_or(u64::MAX);
+        if day < current {
+            env.storage()
+                .instance()
+                .set(&DataKey::MinExpiryBucketDay, &day);
+        }
     }
 
     /// Remove `scout` from the day-granularity expiry bucket for `expires_at`.
