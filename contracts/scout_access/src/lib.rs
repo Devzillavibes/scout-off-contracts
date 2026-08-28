@@ -339,12 +339,24 @@ impl ScoutAccessContract {
         if fees == 0 {
             return Err(ScoutAccessError::NoFeesToWithdraw);
         }
+        
+        // ISSUE #1138: Ensure withdraw_fees does not reduce balance below EscrowedTotal
         let xlm = Self::get_token(&env)?;
         let contract_addr = env.current_contract_address();
-        token::Client::new(&env, &xlm).transfer(&contract_addr, &to, &fees);
-        env.storage().instance().set(&key, &0i128);
-        events::fees_withdrawn(&env, &admin, &to, fees);
-        Ok(fees)
+        let balance = token::Client::new(&env, &xlm).balance(&contract_addr);
+        let escrow_total_key = DataKey::EscrowedTotal;
+        let escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+        let available = balance.saturating_sub(escrowed);
+        let withdrawable = fees.min(available);
+        
+        if withdrawable <= 0 {
+            return Err(ScoutAccessError::NoFeesToWithdraw);
+        }
+        
+        token::Client::new(&env, &xlm).transfer(&contract_addr, &to, &withdrawable);
+        env.storage().instance().set(&key, &(fees - withdrawable));
+        events::fees_withdrawn(&env, &admin, &to, withdrawable);
+        Ok(withdrawable)
     }
 
     pub fn pause_contract(env: Env) -> Result<(), ScoutAccessError> {
@@ -645,6 +657,9 @@ impl ScoutAccessContract {
             PERSISTENT_TTL_MAX,
         );
 
+        // ISSUE #1139: Add scout to tier index for get_subscribers_by_tier
+        Self::add_to_tier_index(&env, &scout, &tier);
+
         // Add scout to the day-granularity expiry bucket so
         // get_expiring_subscriptions can page through soon-to-expire
         // subscriptions without walking every scout.
@@ -822,6 +837,9 @@ impl ScoutAccessContract {
             PERSISTENT_TTL_MIN,
             PERSISTENT_TTL_MAX,
         );
+
+        // ISSUE #1139: Maintain tier index on renewal
+        Self::add_to_tier_index(&env, &scout, &existing.tier);
 
         events::subscription_auto_renewed(&env, &scout, &existing.tier, now, expires_at);
         // Also emit the legacy scout_subscribed event for backward compatibility.
@@ -1377,6 +1395,15 @@ impl ScoutAccessContract {
         let contract_addr = env.current_contract_address();
         token::Client::new(&env, &token_addr).transfer(&scout, &contract_addr, &escrow_amount);
 
+        // ISSUE #1138: Track escrowed total to segregate escrow-held funds
+        // from withdrawable fees. Prevent withdraw_fees from depleting the
+        // escrow reserve.
+        let escrow_total_key = DataKey::EscrowedTotal;
+        let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+        let new_escrowed = safe_add_i128(current_escrowed, escrow_amount)
+            .map_err(|_| ScoutAccessError::Overflow)?;
+        env.storage().instance().set(&escrow_total_key, &new_escrowed);
+
         let escrow = TrialEscrow {
             amount: escrow_amount,
             expires_at,
@@ -1437,16 +1464,32 @@ impl ScoutAccessContract {
         // Player must authorize
         player_wallet.require_auth();
 
-        // Idempotency check: if the caller supplied a nonce and it has already
-        // been processed, return success without replaying escrow cleanup or
-        // level advancement. This runs *before* the escrow load so a retry
-        // after a successful confirmation (escrow already consumed) resolves
-        // to `Ok(())` rather than `TrialOfferAlreadyConfirmed`.
-        if let Some(ref nonce) = idempotency_nonce {
-            let nonce_key = DataKey::ConfirmationNonce(nonce.clone());
-            if env.storage().persistent().has(&nonce_key) {
-                return Ok(());
-            }
+        // ISSUE #1136: Cross-contract verify that player_wallet owns player_id
+        // in the registration contract before proceeding with escrow release.
+        // This prevents any wallet from releasing escrow and advancing an
+        // arbitrary player to Level 3.
+        let reg_contract_addr = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+            .ok_or(ScoutAccessError::InvalidInput)?; // Fail closed if registration not wired
+        let reg_client = registration_contract::Client::new(&env, &reg_contract_addr);
+        let player_profile = reg_client
+            .get_player(&player_id)
+            .map_err(|_| ScoutAccessError::Unauthorized)?;
+        if player_profile.owner != player_wallet {
+            return Err(ScoutAccessError::Unauthorized);
+        }
+
+        // ISSUE #1137: Idempotency nonce must be derived from (player_id, index)
+        // to prevent griefers from pre-seeding arbitrary caller-supplied nonces.
+        // The nonce key now binds to the specific trial offer rather than an
+        // unauthenticated global string.
+        let nonce_key = DataKey::ConfirmationNonce(
+            String::from_str(&env, &format!("trial_confirm:{}:{}", player_id, index))
+        );
+        if env.storage().persistent().has(&nonce_key) {
+            return Ok(());
         }
 
         // Load escrow record
@@ -1469,11 +1512,20 @@ impl ScoutAccessContract {
             // Refund escrow to scout
             let token_addr = Self::get_token(&env)?;
             let contract_addr = env.current_contract_address();
+            let balance = token::Client::new(&env, &token_addr).balance(&contract_addr);
+            if escrow.amount > balance {
+                return Err(ScoutAccessError::InsufficientFee);
+            }
             token::Client::new(&env, &token_addr).transfer(
                 &contract_addr,
                 &offer.scout,
                 &escrow.amount,
             );
+            // ISSUE #1138: Decrement escrowed total on refund
+            let escrow_total_key = DataKey::EscrowedTotal;
+            let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+            let new_escrowed = current_escrowed.saturating_sub(escrow.amount);
+            env.storage().instance().set(&escrow_total_key, &new_escrowed);
             // Cleanup escrow
             env.storage()
                 .persistent()
@@ -1518,17 +1570,19 @@ impl ScoutAccessContract {
         }
 
         // Persist idempotency nonce after successful level advancement so that
-        // a retry after ProgressCallFailed can safely detect the offer was
-        // already confirmed.
-        if let Some(ref nonce) = idempotency_nonce {
-            let nonce_key = DataKey::ConfirmationNonce(nonce.clone());
-            env.storage().persistent().set(&nonce_key, &());
-            env.storage().persistent().extend_ttl(
-                &nonce_key,
-                PERSISTENT_TTL_MIN,
-                PERSISTENT_TTL_MAX,
-            );
-        }
+        // a retry can safely detect the offer was already confirmed.
+        env.storage().persistent().set(&nonce_key, &());
+        env.storage().persistent().extend_ttl(
+            &nonce_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
+        // ISSUE #1138: Decrement escrowed total on successful confirmation
+        let escrow_total_key = DataKey::EscrowedTotal;
+        let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+        let new_escrowed = current_escrowed.saturating_sub(escrow.amount);
+        env.storage().instance().set(&escrow_total_key, &new_escrowed);
 
         // Cleanup escrow after successful confirmation
         env.storage()
@@ -1615,7 +1669,21 @@ impl ScoutAccessContract {
                 }
             };
 
+            // ISSUE #1138: Check balance before transferring to prevent running
+            // out of funds for other escrow refunds
+            let balance = token::Client::new(&env, &token_addr).balance(&contract_addr);
+            if escrow.amount > balance {
+                // Keep this escrow for a later sweep when balance is replenished
+                kept.push_back((player_id, index));
+                continue;
+            }
+
             token::Client::new(&env, &token_addr).transfer(&contract_addr, &scout, &escrow.amount);
+            // ISSUE #1138: Decrement escrowed total on sweep
+            let escrow_total_key = DataKey::EscrowedTotal;
+            let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+            let new_escrowed = current_escrowed.saturating_sub(escrow.amount);
+            env.storage().instance().set(&escrow_total_key, &new_escrowed);
             env.storage().persistent().remove(&escrow_key);
             events::trial_offer_expired(&env, player_id, &scout, index);
             swept = safe_add_u32(swept, 1).map_err(|_| ScoutAccessError::Overflow)?;
@@ -1665,7 +1733,17 @@ impl ScoutAccessContract {
 
         let token_addr = Self::get_token(&env)?;
         let contract_addr = env.current_contract_address();
+        let balance = token::Client::new(&env, &token_addr).balance(&contract_addr);
+        if escrow.amount > balance {
+            return Err(ScoutAccessError::InsufficientFee);
+        }
         token::Client::new(&env, &token_addr).transfer(&contract_addr, &to, &escrow.amount);
+
+        // ISSUE #1138: Decrement escrowed total on admin refund
+        let escrow_total_key = DataKey::EscrowedTotal;
+        let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+        let new_escrowed = current_escrowed.saturating_sub(escrow.amount);
+        env.storage().instance().set(&escrow_total_key, &new_escrowed);
 
         // Same cleanup order as confirm_trial_offer/expire_trial_offers:
         // drop the primary record, then scrub the enumeration index, so no
@@ -2625,7 +2703,6 @@ impl ScoutAccessContract {
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    #[allow(dead_code)]
     fn add_to_tier_index(env: &Env, scout: &Address, tier: &SubscriptionTier) {
         let key = DataKey::TierSubscribers(tier.clone());
         let mut subscribers: Vec<Address> = env
