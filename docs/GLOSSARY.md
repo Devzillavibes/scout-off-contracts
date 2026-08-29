@@ -161,21 +161,32 @@ A formal on-chain challenge raised by a player against a specific milestone
 that was approved for their profile. Only the affected player may file a
 dispute — validators and scouts have no standing to do so.
 
-A dispute record carries two outcome fields that are set when the platform
-admin resolves it:
+A dispute is routed to one of two resolution paths at filing time, based on
+the `impact_score` recorded on the dispute versus `jury_config.impact_threshold`
+(default `100`, admin-configurable via `set_jury_config`):
+
+| Route | Condition | Resolution |
+|---|---|---|
+| Admin-only | `impact_score < impact_threshold` | The platform admin calls `resolve_dispute` |
+| Jury | `impact_score >= impact_threshold` | Active validators call `cast_dispute_vote`; `tally_dispute` finalizes the outcome. `resolve_dispute` is blocked for these disputes (`DisputeRequiresJury`). |
+
+A dispute record carries two outcome fields:
 
 | Field | Values | Meaning |
 |---|---|---|
-| `resolved` | `false` / `true` | Whether the admin has acted on the dispute |
-| `upheld` | `false` / `true` | `true` if the admin agreed the milestone was invalid; `false` if the milestone stands |
+| `resolved` | `false` / `true` | Whether the dispute has been acted on (by the admin or by a completed jury tally) |
+| `upheld` | `false` / `true` | `true` if the milestone was found invalid; `false` if it stands |
 
 When a dispute is upheld the admin is expected to revoke or correct the
 offending milestone through the standard validator-management flow; the
 dispute mechanism itself only records the outcome on-chain.
 
-- Relevant functions: `dispute_milestone`, `resolve_dispute`, `get_dispute`,
+- Relevant functions: `dispute_milestone`, `resolve_dispute`,
+  `cast_dispute_vote`, `tally_dispute`, `set_jury_config`, `get_dispute`,
   `has_dispute` — see
   [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md#verification).
+- See [DISPUTE_JURY.md](DISPUTE_JURY.md) for the jury quorum, voting window,
+  and conflict-of-interest rules.
 
 ---
 
@@ -184,7 +195,10 @@ dispute mechanism itself only records the outcome on-chain.
 A registered footballer with an on-chain identity. A player is identified by a
 `player_id` (auto-incremented `u64`) and a Stellar wallet address. Players
 start at `ProgressLevel` 0 (Unverified) and advance through up to four levels
-as validators approve milestones and scouts log trial offers.
+as validators approve milestones (Levels 1–2). Level 3 (`EliteTier`) requires
+the player to call `confirm_trial_offer` on an Elite-tier scout's logged offer
+before its escrow expires; `log_trial_offer` alone does not advance the level.
+See [Trial Offer](#trial-offer) and [Progress Level](#progress-level).
 
 - Relevant functions: `register_player`, `get_player`, `filter_players` — see
   [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md#registration).
@@ -202,7 +216,7 @@ sequentially; skipping or reversing is blocked by the progress contract (admin
 | 0 | `Unverified` | Profile created, no verifications |
 | 1 | `VerifiedIdentity` | Identity confirmed by a validator |
 | 2 | `PerformanceMilestones` | Performance stats verified by a validator |
-| 3 | `EliteTier` | Trial offer logged by an Elite-tier scout |
+| 3 | `EliteTier` | Player confirmed an Elite-tier scout's trial offer via `confirm_trial_offer` |
 
 - Relevant functions: `advance_level`, `get_level`, `get_progress_history`,
   `reset_player_level` — see
@@ -247,7 +261,7 @@ signal for milestone approvals.
 A talent-discovery professional registered on-chain with a Stellar wallet.
 Scouts purchase a subscription tier (`Basic`, `Pro`, or `Elite`) to access the
 filtered player pool, pay per-contact fees to unlock player details, and (Elite
-only) log trial offers that advance a player to Level 3.
+only) log trial offers that a player can confirm to reach Level 3.
 
 - Relevant functions: `register_scout`, `subscribe`, `pay_to_contact`,
   `log_trial_offer` — see
