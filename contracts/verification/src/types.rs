@@ -319,7 +319,20 @@ pub enum DataKey {
     ValidatorPlayerMilestoneCount(Address, u64),
     ValidatorVector,
     TotalMilestoneCount,
+    /// Reserved legacy key for the pre-ring global milestone index. New reads
+    /// and writes use `GlobalMilestoneWriteHead` + `GlobalMilestoneSlot(slot)`.
     GlobalMilestoneIndex,
+    /// Monotonic write counter for the ring-buffer global milestone index.
+    /// Stored in instance storage. Value is the total number of entries ever
+    /// written (including evicted ones). O(1) to read and update.
+    GlobalMilestoneWriteHead,
+    /// One slot of the ring-buffer global milestone index, stored in
+    /// **persistent** storage (not instance) so individual slots have
+    /// per-key TTL management and the hot instance-storage entry does not
+    /// balloon with each slot write.
+    ///
+    /// `slot_index = write_head % MAX_GLOBAL_MILESTONE_INDEX`
+    GlobalMilestoneSlot(u32),
     /// Persistent config for diversity-gated milestone advancement
     DiversityConfig,
     /// Persistent index: player_id → Vec<String> distinct affiliations that have contributed milestones
@@ -411,6 +424,17 @@ pub enum DataKey {
     /// Re-wiring epoch for `DataKey::RegistrationContract`, bumped by every
     /// `set_registration_contract` / `update_registration_contract` call.
     RegistrationContractEpoch,
+
+    // ── Jury escalation system (issue #1036) ──
+    /// Admin-configurable jury parameters stored in instance storage.
+    /// Defaults: impact_threshold=100, quorum=3, voting_window_secs=604800.
+    JuryConfig,
+    /// Individual validator vote on a jury-required dispute.
+    /// Keyed by (player_id, milestone_index, validator_wallet).
+    DisputeVote(u64, u32, Address),
+    /// Running vote count for a dispute, keyed by (player_id, milestone_index).
+    /// Provides an O(1) count without scanning individual DisputeVote entries.
+    DisputeVoteCount(u64, u32),
 
     // ── Validator revocation cascade re-review (issue #1039) ──
     /// Persisted `RevocationRecord` for a revoked validator wallet.

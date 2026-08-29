@@ -17,10 +17,10 @@ mod types;
 
 pub use errors::VerificationError;
 pub use types::{
-    AttestationStatus, ContractHealth, DataKey, DiversityConfig, GlobalMilestoneEntry,
-    GlobalMilestoneIndexPage, Milestone, MilestoneAttestation, MilestoneDispute, MilestoneRef,
-    MilestoneWithValidatorStatus, PendingMilestoneClaim, PendingVoteRef, RevocationRecord,
-    RevocationSeverity, Validator, ValidatorActivityReport, ValidatorStatus,
+    AttestationStatus, ContractHealth, DataKey, DiversityConfig, DisputeVote, GlobalMilestoneEntry,
+    GlobalMilestoneIndexPage, JuryConfig, Milestone, MilestoneAttestation, MilestoneDispute,
+    MilestoneRef, MilestoneWithValidatorStatus, PendingMilestoneClaim, PendingVoteRef,
+    RevocationRecord, RevocationSeverity, Validator, ValidatorActivityReport, ValidatorStatus,
     VerificationWiringState,
 };
 
@@ -2235,20 +2235,64 @@ impl VerificationContract {
         offset: u32,
         limit: u32,
     ) -> GlobalMilestoneIndexPage {
-        let all: Vec<GlobalMilestoneEntry> = env
+        // ── Ring-buffer read ──────────────────────────────────────────────────
+        //
+        // State layout:
+        //   GlobalMilestoneWriteHead  (instance, u32) — monotonic count of all
+        //     writes ever; may exceed MAX_GLOBAL_MILESTONE_INDEX once the buffer
+        //     has cycled.
+        //   GlobalMilestoneSlot(slot) (persistent, GlobalMilestoneEntry) — one
+        //     live entry at slot = write_index % MAX_GLOBAL_MILESTONE_INDEX.
+        //
+        // Pagination semantics (insertion order, oldest-first):
+        //   live_count = min(write_head, CAP)
+        //   If write_head < CAP: slots 0..write_head are filled in write order.
+        //   If write_head >= CAP: oldest slot = write_head % CAP, wrapping around.
+        //
+        // offset=0 → oldest surviving entry; offset=live_count-1 → newest.
+
+        let write_head: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::GlobalMilestoneIndex)
-            .unwrap_or_else(|| Vec::new(&env));
-        let total = all.len();
+            .get(&DataKey::GlobalMilestoneWriteHead)
+            .unwrap_or(0u32);
+
+        let cap = MAX_GLOBAL_MILESTONE_INDEX;
+        let live_count = write_head.min(cap);
+        let page_cap = limit.min(50);
+
         let mut entries = Vec::new(&env);
-        let cap = if limit > 50 { 50 } else { limit };
+
+        if live_count == 0 || offset >= live_count || page_cap == 0 {
+            return GlobalMilestoneIndexPage {
+                entries,
+                total: live_count,
+            };
+        }
+
+        // When write_head < cap the oldest slot is always 0.
+        // When write_head >= cap the oldest slot is write_head % cap (that
+        // slot was written earliest among the surviving entries and will be
+        // overwritten next).
+        let oldest_slot = if write_head < cap { 0u32 } else { write_head % cap };
+
         let mut i = offset;
-        while i < total && entries.len() < cap {
-            entries.push_back(all.get(i).unwrap());
+        while i < live_count && entries.len() < page_cap {
+            let slot = (oldest_slot + i) % cap;
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, GlobalMilestoneEntry>(&DataKey::GlobalMilestoneSlot(slot))
+            {
+                entries.push_back(entry);
+            }
             i += 1;
         }
-        GlobalMilestoneIndexPage { entries, total }
+
+        GlobalMilestoneIndexPage {
+            entries,
+            total: live_count,
+        }
     }
 
     pub fn get_validator(env: Env, wallet: Address) -> Result<Validator, VerificationError> {
@@ -2506,7 +2550,7 @@ impl VerificationContract {
     /// - `TotalMilestoneCount` — platform-wide count
     /// - `ValidatorMilestoneCount(validator)` — per-validator count
     /// - `ValidatorPlayerMilestoneCount(validator, player_id)` — per-(validator,player) count
-    /// - `GlobalMilestoneIndex` — audit index (capped at `MAX_GLOBAL_MILESTONE_INDEX`)
+    /// - ring-buffer global audit index (capped at `MAX_GLOBAL_MILESTONE_INDEX`)
     /// - `ValidatorMilestones(validator)` — compact per-validator index
     /// - `ValidatorPlayers(validator)` — per-validator distinct-player index
     ///
@@ -2626,26 +2670,30 @@ impl VerificationContract {
             .persistent()
             .extend_ttl(&vpmc_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
-        // ── Update GlobalMilestoneIndex (instance storage, capped) ────────────
-        let gmi_key = DataKey::GlobalMilestoneIndex;
-        let mut gmi: Vec<GlobalMilestoneEntry> = env
-            .storage()
-            .instance()
-            .get(&gmi_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        let already_in_gmi = gmi
-            .iter()
-            .any(|e| e.player_id == player_id && e.milestone_index == milestone_index);
-        if !already_in_gmi {
-            if gmi.len() >= MAX_GLOBAL_MILESTONE_INDEX {
-                gmi.remove(0);
-            }
-            gmi.push_back(GlobalMilestoneEntry {
+        // ── Update ring-buffer global milestone index ─────────────────────────
+        // Mirror the same O(1) write path used by commit_approved_milestone:
+        // read write_head, compute slot, write slot entry, increment write_head.
+        // Because admin_seed_milestone must be idempotent and seeds in index
+        // order (validated above), each seed call is a fresh sequential write.
+        let wh_key = DataKey::GlobalMilestoneWriteHead;
+        let write_head: u32 = env.storage().instance().get(&wh_key).unwrap_or(0u32);
+        let slot = write_head % MAX_GLOBAL_MILESTONE_INDEX;
+        env.storage().persistent().set(
+            &DataKey::GlobalMilestoneSlot(slot),
+            &GlobalMilestoneEntry {
                 player_id,
                 milestone_index,
-            });
-            env.storage().instance().set(&gmi_key, &gmi);
-        }
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::GlobalMilestoneSlot(slot),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+        env.storage().instance().set(
+            &wh_key,
+            &(safe_add_u32(write_head, 1).map_err(|_| VerificationError::Overflow)?),
+        );
 
         // ── Update ValidatorMilestones(validator) ─────────────────────────────
         let vm_key = DataKey::ValidatorMilestones(validator.clone());
@@ -2819,6 +2867,7 @@ impl VerificationContract {
         player_id: u64,
         milestone_index: u32,
         reason: String,
+        impact_score: u32,
     ) -> Result<(), VerificationError> {
         Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env)?;
@@ -2827,7 +2876,8 @@ impl VerificationContract {
         player_wallet.require_auth();
 
         // Verify the milestone exists
-        env.storage()
+        let milestone: Milestone = env
+            .storage()
             .persistent()
             .get::<DataKey, Milestone>(&DataKey::Milestone(player_id, milestone_index))
             .ok_or(VerificationError::MilestoneNotFound)?;
@@ -2889,7 +2939,10 @@ impl VerificationContract {
 
         // Keep the approver address from the milestone for conflict-of-interest checks.
         // This is read during cast_dispute_vote via the Milestone storage record directly.
-        let _ = milestone; // milestone fetched above for validation; approver accessible via Milestone storage
+        // Suppress the unused-variable warning — `milestone` was fetched above for
+        // existence validation; the approver address is re-read from storage in
+        // cast_dispute_vote to avoid re-serialising the full record here.
+        let _ = &milestone.validator;
 
         env.storage().persistent().set(&dispute_key, &dispute);
 
@@ -3851,21 +3904,33 @@ impl VerificationContract {
             &(safe_add_u32(total, 1).map_err(|_| VerificationError::Overflow)?),
         );
 
-        let mut global_index: Vec<GlobalMilestoneEntry> = env
+        // ── O(1) ring-buffer write ────────────────────────────────────────────
+        // Reads one instance key (write_head), writes one persistent slot, and
+        // writes one instance key (write_head+1). Cost is constant regardless
+        // of how many entries currently live in the ring or have ever been
+        // written — there is no Vec to read, shift, or serialize.
+        let write_head: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::GlobalMilestoneIndex)
-            .unwrap_or_else(|| Vec::new(env));
-        if global_index.len() >= MAX_GLOBAL_MILESTONE_INDEX {
-            global_index.remove(0);
-        }
-        global_index.push_back(GlobalMilestoneEntry {
-            player_id,
-            milestone_index: next_index,
-        });
-        env.storage()
-            .instance()
-            .set(&DataKey::GlobalMilestoneIndex, &global_index);
+            .get(&DataKey::GlobalMilestoneWriteHead)
+            .unwrap_or(0u32);
+        let slot = write_head % MAX_GLOBAL_MILESTONE_INDEX;
+        env.storage().persistent().set(
+            &DataKey::GlobalMilestoneSlot(slot),
+            &GlobalMilestoneEntry {
+                player_id,
+                milestone_index: next_index,
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::GlobalMilestoneSlot(slot),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+        env.storage().instance().set(
+            &DataKey::GlobalMilestoneWriteHead,
+            &(safe_add_u32(write_head, 1).map_err(|_| VerificationError::Overflow)?),
+        );
 
         let validator_milestones_key = DataKey::ValidatorMilestones(validator_wallet.clone());
         let mut validator_milestones: Vec<MilestoneRef> = env
@@ -5805,6 +5870,7 @@ mod tests {
             &1u64,
             &1u32,
             &String::from_str(&env, "Wrong attribution"),
+            &0u32,
         );
         assert_eq!(client.get_active_disputes_count(), 1);
 
@@ -5813,6 +5879,7 @@ mod tests {
             &2u64,
             &1u32,
             &String::from_str(&env, "Also wrong"),
+            &0u32,
         );
         assert_eq!(client.get_active_disputes_count(), 2);
     }
@@ -5848,6 +5915,7 @@ mod tests {
             &1u64,
             &1u32,
             &String::from_str(&env, "First dispute"),
+            &0u32,
         );
         assert_eq!(client.get_active_disputes_count(), 1);
 
@@ -5857,6 +5925,7 @@ mod tests {
             &1u64,
             &1u32,
             &String::from_str(&env, "Second attempt"),
+            &0u32,
         );
         assert!(result.is_err());
         // Count must remain 1
@@ -5891,6 +5960,7 @@ mod tests {
             &1u64,
             &1u32,
             &String::from_str(&env, "Wrong attribution"),
+            &0u32,
         );
         assert_eq!(client.get_active_disputes_count(), 1);
 
@@ -5930,6 +6000,7 @@ mod tests {
             &2u64,
             &1u32,
             &String::from_str(&env, "Wrong attribution"),
+            &0u32,
         );
 
         client.resolve_dispute(&2u64, &1u32, &false);
@@ -5977,7 +6048,7 @@ mod tests {
         );
 
         let reason = String::from_str(&env, "Wrong attribution");
-        client.dispute_milestone(&player_wallet, &2u64, &1u32, &reason);
+        client.dispute_milestone(&player_wallet, &2u64, &1u32, &reason, &0u32);
 
         let events = env.events().all();
         assert_eq!(
@@ -6035,6 +6106,7 @@ mod tests {
             &3u64,
             &1u32,
             &String::from_str(&env, "Wrong attribution"),
+            &0u32,
         );
         client.resolve_dispute(&3u64, &1u32, &true);
 
@@ -6090,6 +6162,7 @@ mod tests {
             &player_id,
             &milestone_index,
             &String::from_str(&env, "Milestone was not completed"),
+            &0u32,
         );
 
         // After dispute: must return true
@@ -6136,6 +6209,7 @@ mod tests {
             &1u64,
             &1u32,
             &String::from_str(&env, "Disputed"),
+            &0u32,
         );
 
         // The disputed milestone returns true
@@ -6189,6 +6263,7 @@ mod tests {
             &disputed_player_id,
             &disputed_milestone_index,
             &String::from_str(&env, "Dispute reason"),
+            &0u32,
         );
 
         let existing_dispute =
@@ -6247,6 +6322,7 @@ mod tests {
             &player_id,
             &milestone_index,
             &String::from_str(&env, "Fabricated reason"),
+            &0u32,
         );
         assert_eq!(result, Err(Ok(VerificationError::Unauthorized)));
     }
@@ -6288,6 +6364,7 @@ mod tests {
             &player_id,
             &milestone_index,
             &String::from_str(&env, "Legitimate concern"),
+            &0u32,
         );
         assert!(result.is_ok());
         assert!(client.has_dispute(&player_id, &milestone_index));
