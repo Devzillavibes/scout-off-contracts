@@ -17,6 +17,13 @@ reported by every contract's `version()` function.
 
 > **Note:** `Cargo.toml` `[workspace.package].version` is the build-time source of truth; keep the Version History table below in sync with every Cargo version bump.
 
+> **Bindings packages:** the TypeScript binding packages under `bindings/` are
+> versioned in lockstep with the workspace version.
+> `scripts/generate-bindings.sh` derives the version from `Cargo.toml` and
+> rewrites each generated `package.json` after generation (the CLI overwrites
+> the scaffold with its own placeholder version), so a workspace version bump
+> automatically propagates to the bindings on the next regeneration.
+
 Each contract exposes a `version()` function that returns its current version string:
 
 ```bash
