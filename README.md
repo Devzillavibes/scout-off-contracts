@@ -553,7 +553,7 @@ Secondary features (fractionalized sponsorship, oracle integrations, advanced fi
 
 - `soroban-sdk = "25.3.1"` — Soroban smart contract SDK (all four contracts)
 - `stellar-cli` — Stellar CLI for deployment and contract invocation
-- `wasm32-unknown-unknown` — Rust compilation target for Soroban WASM output
+- `wasm32v1-none` — Rust compilation target for Soroban WASM output
 
 Frontend and backend dependencies live in their respective repos (`scoutchain-frontend`, `scoutchain-backend`).
 
