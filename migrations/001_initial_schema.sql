@@ -6,6 +6,10 @@
 -- -----------------------------------------------------------------------
 -- Players
 -- -----------------------------------------------------------------------
+-- Note: the deactivated column was added in #837 to track
+-- registration.deactivate_player / reactivate_player events.
+-- This resolves the "Known gap" previously documented in docs/INDEXER.md.
+-- Reconciliation for this column is tracked in #1060.
 CREATE TABLE IF NOT EXISTS players (
     player_id       BIGINT PRIMARY KEY,
     wallet          VARCHAR(56)  NOT NULL UNIQUE,   -- Stellar G-address
@@ -15,6 +19,7 @@ CREATE TABLE IF NOT EXISTS players (
     nationality     VARCHAR(128) NOT NULL,
     ipfs_hashes     TEXT[]       NOT NULL DEFAULT '{}',
     level           SMALLINT     NOT NULL DEFAULT 0, -- 0-3
+    deactivated     BOOLEAN      NOT NULL DEFAULT FALSE,  -- added per #837
     registered_at   BIGINT       NOT NULL,           -- Unix timestamp
     updated_at      BIGINT       NOT NULL,
     created_db_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()

@@ -101,8 +101,13 @@ by any actual query:
 
 - `scouts.verified` (`registration.get_scout`) has no column in
   `scout_subscriptions`/`scouts`.
+
+### Known gaps (resolved)
+
 - Player deactivation (`registration.deactivate_player` /
-  `reactivate_player`) has no column in `players`.
+  `reactivate_player`): the `deactivated` column was added to the `players`
+  table in #837. Reconciliation of this column against on-chain state is
+  tracked in #1060.
 
 ## What to do when drift is found
 
