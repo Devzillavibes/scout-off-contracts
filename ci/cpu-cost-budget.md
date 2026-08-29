@@ -1,5 +1,13 @@
 # CPU-instruction cost budgets
 
+> **Note on cpu-cost-budget-report.txt**: This CI job uploads measured costs as
+> the `cpu-cost-budget-<sha>` artifact. The file `cpu-cost-budget-report.txt`
+> is **not committed to the repository** — it is generated locally or by CI and
+> is listed in `.gitignore`. `scripts/calibrate-budgets.py` reads the CI
+> artifact, not any local copy. The numbers in the "Current budgets" table
+> below are the checked-in reference baselines; they should be updated whenever
+> a `*_CPU_BUDGET` constant changes (see "Raising a budget" below).
+
 This file documents the CPU-instruction cost budgets enforced by
 `tests/cost_budget.rs` in each contract package (`contracts/*/tests/cost_budget.rs`).
 Those files are the source of truth — the numbers here mirror the checked-in
