@@ -91,3 +91,46 @@ fn cost_get_progress_history_page() {
         GET_PROGRESS_HISTORY_PAGE_CPU_BUDGET,
     );
 }
+
+// Budget for advance_level when the player already has a long history.
+// Deliberately generous — tighten after first real CI run (see ci/cpu-cost-budget.md).
+const ADVANCE_LEVEL_LONG_HISTORY_CPU_BUDGET: u64 = 30_000_000;
+
+/// Confirm that `advance_level` cost stays bounded even with a long history.
+///
+/// The previous version of this test tried to build history by calling
+/// `advance_level` in a loop, but `advance_level` caps at `EliteTier`
+/// (`AlreadyAtMaxLevel`), so the loop could only produce 3 entries and the
+/// test always failed at setup rather than measuring anything meaningful.
+///
+/// Fix: alternate `advance_level` with `reset_player_level` to build a
+/// genuinely long history (20 full advance+reset cycles = 40 history entries),
+/// then measure the cost of one final `advance_level` against the budget.
+///
+/// This validates the invariant: "advance_level cost is bounded regardless of
+/// history length" — which matters because `record_progress_entry` touches the
+/// `HistoryVec` on every call and the O(n) concern for `HistoryVec` reads is
+/// real if the implementation ever iterates the full vector.
+#[test]
+fn cost_advance_level_stays_bounded_even_with_long_history() {
+    let (env, client, verification) = setup();
+    let player_id = 2u64;
+    let history_cycles = 20u32;
+
+    // Build a long history via advance+reset cycles.
+    // Each cycle: advance from Unverified → VerifiedIdentity, then reset back.
+    // This produces 2 history entries per cycle without hitting the max-level cap.
+    for i in 0..history_cycles {
+        client.advance_level(&verification, &player_id, &(i + 1));
+        client.reset_player_level(&player_id, &ProgressLevel::Unverified);
+    }
+
+    // Now measure the cost of one fresh advance with the long history already in place.
+    env.cost_estimate().budget().reset_default();
+    client.advance_level(&verification, &player_id, &(history_cycles + 1));
+    assert_cpu_budget(
+        &env,
+        "advance_level_long_history",
+        ADVANCE_LEVEL_LONG_HISTORY_CPU_BUDGET,
+    );
+}
