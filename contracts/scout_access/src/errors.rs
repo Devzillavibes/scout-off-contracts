@@ -70,6 +70,11 @@ pub enum ScoutAccessError {
     // ── Admin transfer ──
     /// `accept_admin` called before an admin transfer was proposed.
     PendingAdminNotSet = 21,
+
+    // ── Fee config proposal ──
+    /// `cancel_fee_config_proposal` or `activate_fee_config` called when
+    /// there is no pending fee config proposal to act on.
+    NoPendingFeeConfig = 24,
 }
 
 impl AdminError for ScoutAccessError {

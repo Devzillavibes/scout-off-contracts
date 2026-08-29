@@ -161,6 +161,52 @@ pub fn fee_config_updated(
     );
 }
 
+/// Emitted when an admin proposes a new fee config.
+/// topics: (event_name, admin)  data: proposed_config
+pub fn fee_config_proposal_proposed(
+    env: &Env,
+    admin: &Address,
+    proposed_config: &crate::types::FeeConfig,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_config_proposal_proposed"),
+            admin.clone(),
+        ),
+        proposed_config.clone(),
+    );
+}
+
+/// Emitted when a pending fee config proposal is cancelled by the admin.
+/// topics: (event_name, admin)  data: cancelled_config
+pub fn fee_config_proposal_cancelled(
+    env: &Env,
+    admin: &Address,
+    cancelled_config: &crate::types::FeeConfig,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "fee_config_proposal_cancelled"),
+            admin.clone(),
+        ),
+        cancelled_config.clone(),
+    );
+}
+
+/// Emitted when a pending fee config proposal is activated (becomes live).
+/// topics: (event_name, admin)  data: (old_config, new_config)
+pub fn fee_config_activated(
+    env: &Env,
+    admin: &Address,
+    old_config: &crate::types::FeeConfig,
+    new_config: &crate::types::FeeConfig,
+) {
+    env.events().publish(
+        (Symbol::new(env, "fee_config_activated"), admin.clone()),
+        (old_config.clone(), new_config.clone()),
+    );
+}
+
 /// Emitted when confirm_trial_offer is skipped because the progress contract
 /// address has not been configured.  Indicates missing wiring; the indexer
 /// should alert on this event in production.

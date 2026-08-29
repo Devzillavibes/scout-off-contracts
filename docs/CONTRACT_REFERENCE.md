@@ -1777,6 +1777,70 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
 
 ---
 
+#### `propose_fee_config(fee_config: FeeConfig) -> Result<(), ScoutAccessError>`
+
+Propose a new fee configuration without applying it immediately. The proposal
+is stored under `DataKey::PendingFeeConfig`. A subsequent call to
+`activate_fee_config` applies it; `cancel_fee_config_proposal` abandons it.
+A second `propose_fee_config` before activation overwrites the first proposal
+and restarts any associated delay clock.
+
+Emits `fee_config_proposal_proposed`.
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `Unauthorized` · `InvalidInput` |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- propose_fee_config \
+  --fee_config '{"contact_fee_stroops":200000,"basic_sub_stroops":2000000,"pro_sub_stroops":5000000,"elite_sub_stroops":10000000,"sub_duration_secs":2592000,"pro_contact_limit":20}'
+```
+
+---
+
+#### `activate_fee_config() -> Result<(), ScoutAccessError>`
+
+Apply a previously proposed fee configuration. Replaces the live config and
+clears `DataKey::PendingFeeConfig`. Returns `NoPendingFeeConfig` if no
+proposal exists.
+
+Emits `fee_config_activated` with both old and new configs.
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `Unauthorized` · `NoPendingFeeConfig` |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID -- activate_fee_config
+```
+
+---
+
+#### `cancel_fee_config_proposal() -> Result<(), ScoutAccessError>`
+
+Cancel a pending fee configuration proposal. Removes `DataKey::PendingFeeConfig`
+and emits `fee_config_proposal_cancelled` with the abandoned config in the
+event data so off-chain indexers can record the event. Returns
+`NoPendingFeeConfig` if there is no pending proposal.
+
+This resolves the open item in `docs/FEE_CONFIG_PROPOSAL_DESIGN.md` that
+previously marked cancellation as future work. See
+[#1178](https://github.com/scout-off/scout-off-contracts/issues/1178).
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `Unauthorized` · `NoPendingFeeConfig` |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID -- cancel_fee_config_proposal
+```
+
+---
+
 #### `withdraw_fees(to: Address) -> Result<i128, ScoutAccessError>`
 
 Transfer all accumulated platform fees to the given address. Returns the amount

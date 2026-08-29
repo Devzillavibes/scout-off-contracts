@@ -145,6 +145,74 @@ impl ScoutAccessContract {
         Ok(())
     }
 
+    /// Propose a new fee config. The proposal is stored under
+    /// `DataKey::PendingFeeConfig` and does not take effect immediately.
+    /// Admin calls `activate_fee_config` to apply it, or
+    /// `cancel_fee_config_proposal` to abandon it.
+    pub fn propose_fee_config(env: Env, fee_config: FeeConfig) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::validate_fee_config(&fee_config)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingFeeConfig, &fee_config);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PendingFeeConfig,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
+        events::fee_config_proposal_proposed(&env, &admin, &fee_config);
+        Ok(())
+    }
+
+    /// Activate a previously proposed fee config. Replaces the live config
+    /// and clears the pending proposal. Returns `NoPendingFeeConfig` if there
+    /// is no pending proposal.
+    pub fn activate_fee_config(env: Env) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+
+        let pending: FeeConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingFeeConfig)
+            .ok_or(ScoutAccessError::NoPendingFeeConfig)?;
+
+        let old_config = Self::fee_config(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &pending);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingFeeConfig);
+
+        events::fee_config_activated(&env, &admin, &old_config, &pending);
+        Ok(())
+    }
+
+    /// Cancel a pending fee config proposal. Removes `DataKey::PendingFeeConfig`
+    /// and emits `fee_config_proposal_cancelled`. Returns `NoPendingFeeConfig`
+    /// if there is no pending proposal to cancel.
+    pub fn cancel_fee_config_proposal(env: Env) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+
+        let pending: FeeConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingFeeConfig)
+            .ok_or(ScoutAccessError::NoPendingFeeConfig)?;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingFeeConfig);
+
+        events::fee_config_proposal_cancelled(&env, &admin, &pending);
+        Ok(())
+    }
+
     pub fn withdraw_fees(env: Env, to: Address) -> Result<i128, ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;

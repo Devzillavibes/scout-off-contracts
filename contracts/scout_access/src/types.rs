@@ -141,4 +141,8 @@ pub enum DataKey {
     /// (push on creation) and `confirm_trial_offer` (remove on cleanup) so
     /// `expire_trial_offers` can sweep stale escrows without an off-chain index.
     OutstandingTrialEscrows,
+    /// Proposed fee config awaiting activation after the timelock delay.
+    /// Stored by `propose_fee_config`; cleared by `activate_fee_config` or
+    /// `cancel_fee_config_proposal`.
+    PendingFeeConfig,
 }
