@@ -52,6 +52,8 @@ fn reg_validator(env: &Env, client: &VerificationContractClient, creds: &str) ->
     client.register_validator(
         &wallet,
         &String::from_str(env, creds),
+        &String::from_str(env, "Default Academy"),
+        &String::from_str(env, "Default Region"),
         &Vec::new(env),
     );
     wallet

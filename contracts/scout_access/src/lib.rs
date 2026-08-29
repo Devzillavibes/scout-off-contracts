@@ -4690,12 +4690,7 @@ mod tests {
         // Register a milestone so the trial-offer's milestone_ref (index 1)
         // validates against the verification contract's milestone count.
         let validator = Address::generate(&env);
-        ver_client.register_validator(
-            &validator,
-            &String::from_str(&env, "UEFA-B-License"),
-            &String::from_str(&env, "Default Academy"),
-            &Vec::new(&env),
-        );
+        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA-B-License"), &String::from_str(&env, "Default Academy"), &String::from_str(&env, "Default Region"), &Vec::new(&env));
         ver_client.approve_milestone(
             &validator,
             &player_id,
@@ -4779,12 +4774,7 @@ mod tests {
         // Register a milestone so the trial-offer's milestone_ref (index 1)
         // validates against the verification contract's milestone count.
         let validator = Address::generate(&env);
-        ver_client.register_validator(
-            &validator,
-            &String::from_str(&env, "UEFA-B-License"),
-            &String::from_str(&env, "Default Academy"),
-            &Vec::new(&env),
-        );
+        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA-B-License"), &String::from_str(&env, "Default Academy"), &String::from_str(&env, "Default Region"), &Vec::new(&env));
         ver_client.approve_milestone(
             &validator,
             &player_id,
