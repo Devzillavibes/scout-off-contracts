@@ -121,7 +121,7 @@ Progress levels are configured per player and enforced on-chain by authorized va
 ### Validator Functions
 
 - `approve_milestone(player_id, milestone, evidence_hash)` — Confirm a player achievement and trigger progress update (validator auth required)
-- `register_validator(wallet, credentials)` — Onboard a new coach, academy, or trainer as an authorized validator (admin auth required)
+- `register_validator(wallet, credentials, affiliation, specializations)` — Onboard a new coach, academy, or trainer as an authorized validator (admin auth required). `affiliation` is the canonical organization identifier used for diversity gating, while `specializations` is the optional list of category tags (for example `"physical-stats"` or `"identity-kyc"`) that gate milestone approval when `milestone_category` is set.
 - `revoke_validator(wallet)` — Remove a validator from the trusted registry (admin auth required)
 
 ### Scout Functions
@@ -183,7 +183,7 @@ Each tier controls which player progress levels a scout can view and what action
 - "Academy confirms active membership" → Level 1 milestone, approved by KYC agent (`milestone_category: "identity-kyc"` — only validators tagged for identity-kyc)
 - "Trial offer received from FC Example" → Level 3 milestone, logged by scout via `log_trial_offer` and confirmed by the player via `confirm_trial_offer`
 
-Validators gain optional **specialization tags** (e.g. `"physical-stats"`, `"identity-kyc"`, `"match-performance"`) when registered. When `approve_milestone` is called with a `milestone_category`, the contract enforces that the validator holds a matching tag — preventing, for example, a pure identity-KYC agent from approving physical performance data. Untagged milestones (category omitted) remain open to any active validator, preserving backward compatibility.
+Validators are registered with an admin-set **affiliation** (canonical organization identifier, such as `"FC Example Academy"` or `"City Performance Lab"`) to gate diversity checks by distinct organizations. They also gain optional **specialization tags** (e.g. `"physical-stats"`, `"identity-kyc"`, `"match-performance"`) when registered. When `approve_milestone` is called with a `milestone_category`, the contract enforces that the validator holds a matching tag — preventing, for example, a pure identity-KYC agent from approving physical performance data. Untagged milestones (category omitted) remain open to any active validator, preserving backward compatibility.
 
 ## Player Lifecycle — Sequence Diagram
 
