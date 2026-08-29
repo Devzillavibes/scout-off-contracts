@@ -254,7 +254,7 @@ WHERE id = 1;
 -- 4. Restart the indexer — it will stream events from ledger 0.
 ```
 
-### 7. Seed migrated state (optional)
+### 8. Seed migrated state (optional)
 
 For fresh deployments of an existing production dataset, use the admin-only
 seeding entrypoints to replay exported player/scout profiles without requiring
@@ -285,7 +285,7 @@ stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
 > be used during a controlled migration replay before the contract serves any
 > real wallet-signed registrations.
 
-### 8. Verify indexer consistency
+### 9. Verify indexer consistency
 
 ```bash
 node scripts/reconcile-indexer.js
