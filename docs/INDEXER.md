@@ -76,7 +76,7 @@ too, not only value-level drift on rows both sides already agree exist.
 |-------|-----------------|------------------|
 | `players` | `registration.get_player_count` + `get_player`, `progress.get_level` | age, position, region, nationality, ipfs_hashes, level, registered_at, updated_at |
 | `scouts` | `registration.get_scout_count` + `get_scout` | wallet, region, registered_at |
-| `validators` | DB-driven `verification.get_validator`, cross-checked against `get_validators` (active list) | credentials, active, registered_at, existence |
+| `validators` | DB-driven `verification.get_validator`, cross-checked against `get_validators` (active list); revocation status is populated from the `validator_revoked` event (severity is a data field — see note below) | credentials, active, registered_at, existence |
 | `milestones` | `verification.get_milestone_count` + `get_milestone`, per player | validator, description, evidence_hash, approved_at |
 | `milestone_disputes` | `verification.has_dispute` / `get_dispute`, tied to the milestone loop | reason, disputed_at, resolved, upheld |
 | `scout_subscriptions` | `scout_access.get_subscribers_by_tier` (all three tiers) + `get_subscription` | tier, subscribed_at, expires_at |
@@ -91,6 +91,13 @@ emitted event, which is a different tool. The script documents this
 explicitly (it prints them under "Skipped" rather than silently omitting
 them) and, for `player_level_history`, cross-checks the per-player row count
 against `progress.get_history_count` as a cheap drift signal.
+
+> **Validator revocation events**: the contract emits a single `validator_revoked`
+> event for all revocations. The revocation severity (routine vs. for-cause) is
+> carried as a **data field** inside that event, not as a separate event name.
+> There is no `validator_revoked_for_cause` event — an indexer subscribing to
+> that topic receives nothing. Subscribe to `validator_revoked` and
+> discriminate on the severity field in the event data.
 
 ## Known gaps between the contracts and this schema
 
