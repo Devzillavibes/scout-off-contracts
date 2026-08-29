@@ -879,16 +879,11 @@ impl VerificationContract {
             .persistent()
             .set(&validator_milestones_key, &validator_milestones);
 
-        events::milestone_approved(
-            &env,
-            player_id,
-            &validator_wallet,
-            next_index,
-            &description,
-            &evidence_hash,
-        );
-
         // Cross-contract call: advance the player's progress level.
+        // Performed before emitting milestone_approved so that event consumers
+        // observing milestone_approved see post-write, post-advance state.
+        // The progress_updated event (emitted inside advance_level) is therefore
+        // ordered before milestone_approved in the transaction event stream.
         // If the progress contract is not wired (e.g. during testing without a
         // full deployment) we emit a diagnostic event and skip advancement so
         // the off-chain indexer can detect the missing wiring.  In production,
@@ -928,6 +923,20 @@ impl VerificationContract {
             // can alert on missing wiring rather than silently swallowing it.
             events::progress_contract_not_set(&env, player_id);
         }
+
+        // Emit milestone_approved after all storage mutations and after the
+        // advance cross-call so that synchronous event consumers read
+        // post-write state.  Event ordering: progress_updated (from
+        // advance_level, if called) is emitted first; milestone_approved
+        // follows deterministically.
+        events::milestone_approved(
+            &env,
+            player_id,
+            &validator_wallet,
+            next_index,
+            &description,
+            &evidence_hash,
+        );
 
         Ok(next_index)
     }
