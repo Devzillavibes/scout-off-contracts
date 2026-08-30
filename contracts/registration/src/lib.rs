@@ -1503,6 +1503,19 @@ mod tests {
                         continue;
                     }
                     if let Ok(profile) = Self::load_player(&env, player_id) {
+                        // The composite index is only a performance hint, never a
+                        // trusted source. Re-validate the loaded profile against the
+                        // filter so a stale or corrupted bucket entry — from a
+                        // deregister_player leak, a set_player_level level/region
+                        // mismatch, or a restored-but-not-reindexed player — cannot
+                        // leak a non-matching player into the results. This mirrors
+                        // the level_gte re-check the slow path already performs.
+                        if !Self::level_gte(&profile.level, &min_level) {
+                            continue;
+                        }
+                        if profile.vitals.region != region {
+                            continue;
+                        }
                         if position_filter && profile.vitals.position != position {
                             continue;
                         }
