@@ -1,175 +1,116 @@
 #!/usr/bin/env bash
-# smoke-test.sh — post-deploy smoke tests for the ScoutChain contracts.
+# ScoutChain — cross-contract smoke test for approve_milestone → advance_level
 #
-# Runs a sequence of lightweight assertions against a live deployment to
-# confirm the contracts came up healthy and key invariants hold.
+# Deploys verification and progress contracts to testnet, wires them, and
+# exercises the real cross-contract call: approve_milestone on verification
+# must atomically advance the player's level in the progress contract.
 #
-# Usage:
-#   ./scripts/smoke-test.sh [NETWORK]
-#
-# NETWORK defaults to "testnet" if not supplied.
-#
-# Requires:
-#   - stellar CLI on PATH
-#   - .env.contracts in the repo root (written by deploy.sh)
-#   - DEPLOYER_SECRET exported or in .env
-#
-# Exit codes:
-#   0 — all smoke tests passed
-#   1 — one or more smoke tests failed
+# Usage: ./scripts/smoke-test.sh
+# Requires: DEPLOYER_SECRET, ADMIN_ADDRESS env vars; stellar CLI installed.
 set -euo pipefail
 
 NETWORK="${1:-testnet}"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_CONTRACTS="$REPO_ROOT/.env.contracts"
-ENV_FILE="$REPO_ROOT/.env"
+DEPLOYER="${DEPLOYER_SECRET:?Set DEPLOYER_SECRET}"
+ADMIN="${ADMIN_ADDRESS:?Set ADMIN_ADDRESS}"
 
-# Load .env if present (provides DEPLOYER_SECRET, etc.)
-if [[ -f "$ENV_FILE" ]]; then
-  # shellcheck source=/dev/null
-  source "$ENV_FILE"
-fi
+WASM_DIR="target/wasm32v1-none/release"
+VER_WASM="${WASM_DIR}/scoutchain_verification.optimized.wasm"
+PROG_WASM="${WASM_DIR}/scoutchain_progress.optimized.wasm"
 
-if [[ ! -f "$ENV_CONTRACTS" ]]; then
-  echo "ERROR: $ENV_CONTRACTS not found. Run scripts/deploy.sh first."
-  exit 1
-fi
+echo "============================================"
+echo "  ScoutChain Cross-Contract Smoke Test"
+echo "============================================"
 
-# shellcheck source=/dev/null
-source "$ENV_CONTRACTS"
-
-DEPLOYER="${DEPLOYER_SECRET:-}"
-if [[ -z "$DEPLOYER" ]]; then
-  echo "ERROR: DEPLOYER_SECRET is not set. Export it or add it to .env."
-  exit 1
-fi
-
-FAIL=0
-TESTS_RUN=0
-TESTS_PASSED=0
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-pass() {
-  echo "  PASS: $1"
-  TESTS_PASSED=$((TESTS_PASSED + 1))
-}
-
-fail() {
-  echo "  FAIL: $1"
-  FAIL=1
-}
-
-invoke_health() {
-  local contract_id="$1"
-  stellar contract invoke \
-    --id "$contract_id" \
-    --network "$NETWORK" \
-    --source "$DEPLOYER" \
-    -- health 2>&1
-}
-
-parse_bool() {
-  local json="$1"
-  local field="$2"
-  echo "$json" | python3 -c "
-import sys, json
-data = json.loads(sys.stdin.read())
-val = data.get('$field', 'MISSING')
-print(str(val).lower())
-" 2>/dev/null || echo "parse_error"
-}
-
-# ---------------------------------------------------------------------------
-# Test: contract health assertions
-#
-# For every contract:
-#   - initialized must be true
-#   - paused must be false (fresh deployment should never come up paused)
-#
-# For scout_access specifically:
-#   - pay_to_contact_paused must also be false (function-scoped pause, #1056)
-# ---------------------------------------------------------------------------
-assert_health() {
-  local name="$1"
-  local contract_id="$2"
-  local check_ptc="${3:-false}"
-
-  TESTS_RUN=$((TESTS_RUN + 1))
-  echo ""
-  echo "-- smoke: $name health() --"
-
-  if [[ -z "$contract_id" ]]; then
-    fail "$name: contract ID is empty — was deploy.sh run successfully?"
-    return
-  fi
-
-  local raw
-  if ! raw=$(invoke_health "$contract_id"); then
-    fail "$name: health() invocation failed — $raw"
-    return
-  fi
-
-  local initialized paused
-  initialized=$(parse_bool "$raw" "initialized")
-  paused=$(parse_bool "$raw" "paused")
-
-  if [[ "$initialized" == "true" ]]; then
-    pass "$name: initialized == true"
-  else
-    fail "$name: initialized expected true, got '$initialized'"
-  fi
-
-  if [[ "$paused" == "false" ]]; then
-    pass "$name: paused == false"
-  else
-    fail "$name: paused expected false, got '$paused' — call unpause_contract if this is intentional"
-  fi
-
-  if [[ "$check_ptc" == "true" ]]; then
-    TESTS_RUN=$((TESTS_RUN + 1))
-    local ptc_paused
-    ptc_paused=$(parse_bool "$raw" "pay_to_contact_paused")
-
-    if [[ "$ptc_paused" == "missing" ]]; then
-      # Field absent means the contract predates #1056; treat as a warning
-      echo "  WARN: pay_to_contact_paused field absent — contract may not include #1056 yet"
-    elif [[ "$ptc_paused" == "false" ]]; then
-      pass "$name: pay_to_contact_paused == false"
-    else
-      fail "$name: pay_to_contact_paused expected false, got '$ptc_paused' — pay_to_contact is inadvertently paused"
-    fi
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-echo "========================================"
-echo "  ScoutChain Smoke Test — $NETWORK"
-echo "========================================"
-
-assert_health "registration"  "${REGISTRATION_CONTRACT_ID:-}"
-assert_health "verification"  "${VERIFICATION_CONTRACT_ID:-}"
-assert_health "progress"      "${PROGRESS_CONTRACT_ID:-}"
-# scout_access has a function-scoped pay_to_contact_paused flag (#1056)
-assert_health "scout_access"  "${SCOUT_ACCESS_CONTRACT_ID:-}" "true"
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+# 1. Build contracts
 echo ""
-echo "========================================"
-echo "  Smoke test summary — $NETWORK"
-echo "  Tests run:    $TESTS_RUN"
-echo "  Tests passed: $TESTS_PASSED"
-if [[ $FAIL -ne 0 ]]; then
-  echo "  RESULT: FAIL"
-  echo "========================================"
-  exit 1
+echo "==> Building contracts..."
+cargo build --workspace --target wasm32v1-none --release
+
+echo "==> Optimizing wasm..."
+stellar contract optimize --wasm "${WASM_DIR}/scoutchain_verification.wasm" \
+  --wasm-out "$VER_WASM"
+stellar contract optimize --wasm "${WASM_DIR}/scoutchain_progress.wasm" \
+  --wasm-out "$PROG_WASM"
+
+# 2. Deploy contracts
+echo ""
+echo "==> Deploying verification contract..."
+VER_ID=$(stellar contract deploy --wasm "$VER_WASM" --source "$DEPLOYER" --network "$NETWORK")
+echo "    verification => $VER_ID"
+
+echo "==> Deploying progress contract..."
+PROG_ID=$(stellar contract deploy --wasm "$PROG_WASM" --source "$DEPLOYER" --network "$NETWORK")
+echo "    progress => $PROG_ID"
+
+# 3. Initialize contracts
+echo ""
+echo "==> Initializing verification contract..."
+stellar contract invoke \
+  --id "$VER_ID" --source "$DEPLOYER" --network "$NETWORK" \
+  -- initialize --admin "$ADMIN"
+
+echo "==> Initializing progress contract..."
+stellar contract invoke \
+  --id "$PROG_ID" --source "$DEPLOYER" --network "$NETWORK" \
+  -- initialize --admin "$ADMIN"
+
+# 4. Wire verification → progress
+echo ""
+echo "==> Wiring verification -> progress..."
+stellar contract invoke \
+  --id "$VER_ID" --source "$DEPLOYER" --network "$NETWORK" \
+  -- set_progress_contract \
+  --progress_contract "$PROG_ID"
+
+# 5. Wire progress → verification (so advance_level validates the caller)
+echo "==> Wiring progress -> verification..."
+stellar contract invoke \
+  --id "$PROG_ID" --source "$DEPLOYER" --network "$NETWORK" \
+  -- set_verification_contract \
+  --addr "$VER_ID"
+
+# 6. Register a validator
+echo ""
+echo "==> Registering validator..."
+# Use ADMIN as the validator wallet for simplicity
+stellar contract invoke \
+  --id "$VER_ID" --source "$DEPLOYER" --network "$NETWORK" \
+  -- register_validator \
+  --wallet "$ADMIN" \
+  --credentials "Smoke Test Coach"
+
+# 7. Approve a milestone (this triggers the cross-contract call)
+echo ""
+echo "==> Approving milestone (cross-contract call)..."
+stellar contract invoke \
+  --id "$VER_ID" --source "$ADMIN" --network "$NETWORK" \
+  -- approve_milestone \
+  --validator_wallet "$ADMIN" \
+  --player_id 1 \
+  --description "Smoke test milestone" \
+  --evidence_hash "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB"
+
+# 8. Verify that the player's level advanced in the progress contract
+echo ""
+echo "==> Verifying cross-contract call succeeded..."
+LEVEL=$(stellar contract invoke \
+  --id "$PROG_ID" --network "$NETWORK" \
+  -- get_level \
+  --player_id 1)
+
+echo "    Player 1 level => $LEVEL"
+
+if echo "$LEVEL" | grep -qi "VerifiedIdentity"; then
+  echo ""
+  echo "============================================"
+  echo "  SMOKE TEST PASSED"
+  echo "  approve_milestone → advance_level wiring OK"
+  echo "============================================"
 else
-  echo "  RESULT: PASS"
-  echo "========================================"
+  echo ""
+  echo "============================================"
+  echo "  SMOKE TEST FAILED"
+  echo "  Expected VerifiedIdentity, got: $LEVEL"
+  echo "============================================"
+  exit 1
 fi
