@@ -9,13 +9,13 @@ partial-rewiring detection, and a rewritten verification script.
 ## Problem Statement (original, #801)
 
 ScoutChain's four contracts are interconnected by peer-address pointer
-fields. The original design doc (below) enumerated five; a sixth link
-(`verification.RegistrationContract`, added by issue #1014 shortly after this
-doc was written) went undocumented here until now, and a seventh and eighth
-(`scout_access.RegistrationContract`, already implemented; `progress`'s
-missing wiring call in `scripts/initialize.sh`, fixed by #1041) rounded out
-the full picture. **There are eight links, not five or six** — see "The Full
-Picture" below for the corrected, current table.
+fields. The table below is the **historical** enumeration from the original
+#801 design doc and is retained for context only — it is not the current
+count and is **not authoritative**. For the corrected, current list of all
+eight links, see **"The Full Picture" below**.
+
+_Historical (#801). **See "The Full Picture" below for the current list of
+all eight links**._
 
 | Contract | Setter | Storage Key | Re-wiring guard |
 |----------|--------|-------------|-----------------|
@@ -26,7 +26,7 @@ Picture" below for the corrected, current table.
 | `progress` | `set_scout_access_contract` | `ScoutAccessContract` | None |
 | `scout_access` | `set_progress_contract` | `ProgressContract` | None |
 
-Today there is **no on-chain mechanism** to ask "are all five links mutually
+Today there is **no on-chain mechanism** to ask "are all links mutually
 consistent?" — `scripts/verify-cross-contract-wiring.sh` polls each contract
 externally, but it can only confirm the contracts are alive; it cannot yet read
 the stored peer addresses (no public getter functions exist for them).

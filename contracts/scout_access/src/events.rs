@@ -284,6 +284,8 @@ pub fn progress_call_failed(env: &Env, player_id: u64, error_code: u32) {
 
 pub const AUTO_RENEW_SET: &str = "auto_renew_set";
 pub const SUBSCRIPTION_AUTO_RENEWED: &str = "subscription_auto_renewed";
+pub const EVIDENCE_ACCESS_GRANTED: &str = "evidence_access_granted";
+pub const EVIDENCE_ACCESS_REVOKED: &str = "evidence_access_revoked";
 
 /// topics: (event_name, scout)  data: enabled
 pub fn auto_renew_set(env: &Env, scout: &Address, enabled: bool) {

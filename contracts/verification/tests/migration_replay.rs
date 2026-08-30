@@ -65,6 +65,12 @@ fn test_seed_dispute_rejected_when_window_closed() {
         disputed_at: 1_700_000_000,
         resolved: false,
         upheld: false,
+        impact_score: 0,
+        jury_required: false,
+        quorum: 0,
+        voting_deadline: 0,
+        votes_for: 0,
+        votes_against: 0,
     };
     let result = client.try_admin_seed_dispute(&1u64, &1u32, &dispute);
     assert_eq!(result, Err(Ok(VerificationError::MigrationNotActive)));
@@ -249,6 +255,12 @@ fn test_seed_dispute_happy_path() {
         disputed_at: 1_700_000_000,
         resolved: false,
         upheld: false,
+        impact_score: 0,
+        jury_required: false,
+        quorum: 0,
+        voting_deadline: 0,
+        votes_for: 0,
+        votes_against: 0,
     };
 
     client.admin_seed_dispute(&1u64, &1u32, &dispute);
@@ -273,6 +285,12 @@ fn test_seed_resolved_dispute_does_not_increment_active_count() {
         disputed_at: 1_700_000_000,
         resolved: true,
         upheld: false,
+        impact_score: 0,
+        jury_required: false,
+        quorum: 0,
+        voting_deadline: 0,
+        votes_for: 0,
+        votes_against: 0,
     };
 
     client.admin_seed_dispute(&1u64, &1u32, &dispute);
@@ -293,6 +311,12 @@ fn test_identical_dispute_replay_is_noop() {
         disputed_at: 1_700_000_000,
         resolved: false,
         upheld: false,
+        impact_score: 0,
+        jury_required: false,
+        quorum: 0,
+        voting_deadline: 0,
+        votes_for: 0,
+        votes_against: 0,
     };
 
     client.admin_seed_dispute(&1u64, &1u32, &dispute);
@@ -315,6 +339,12 @@ fn test_conflicting_dispute_rejected() {
         disputed_at: 1_700_000_000,
         resolved: false,
         upheld: false,
+        impact_score: 0,
+        jury_required: false,
+        quorum: 0,
+        voting_deadline: 0,
+        votes_for: 0,
+        votes_against: 0,
     };
     client.admin_seed_dispute(&1u64, &1u32, &dispute);
 
@@ -338,6 +368,12 @@ fn test_seed_dispute_populates_player_disputes_index() {
         disputed_at: 1_700_000_000,
         resolved: false,
         upheld: false,
+        impact_score: 0,
+        jury_required: false,
+        quorum: 0,
+        voting_deadline: 0,
+        votes_for: 0,
+        votes_against: 0,
     };
     let d1 = MilestoneDispute {
         player_id: 1,
@@ -346,6 +382,12 @@ fn test_seed_dispute_populates_player_disputes_index() {
         disputed_at: 1_700_000_001,
         resolved: true,
         upheld: true,
+        impact_score: 0,
+        jury_required: false,
+        quorum: 0,
+        voting_deadline: 0,
+        votes_for: 0,
+        votes_against: 0,
     };
 
     client.admin_seed_dispute(&1u64, &1u32, &d0);

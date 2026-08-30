@@ -376,3 +376,34 @@ pub fn revocation_cascade_continued(
         (next_cursor, flagged_this_call),
     );
 }
+
+/// Emitted when a validator casts a vote on a jury-required dispute.
+/// topics: (event_name, validator)  data: (player_id, milestone_index, for_upheld)
+pub fn dispute_vote_cast(
+    env: &Env,
+    player_id: u64,
+    milestone_index: u32,
+    validator: &Address,
+    for_upheld: bool,
+) {
+    env.events().publish(
+        (Symbol::new(env, DISPUTE_VOTE_CAST), validator.clone()),
+        (player_id, milestone_index, for_upheld),
+    );
+}
+
+/// Emitted when a jury-required dispute is tallied and resolved.
+/// topics: (event_name, player_id)  data: (milestone_index, upheld, votes_for, votes_against)
+pub fn dispute_tallied(
+    env: &Env,
+    player_id: u64,
+    milestone_index: u32,
+    upheld: bool,
+    votes_for: u32,
+    votes_against: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, DISPUTE_TALLIED), player_id),
+        (milestone_index, upheld, votes_for, votes_against),
+    );
+}
