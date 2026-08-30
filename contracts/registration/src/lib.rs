@@ -9,7 +9,7 @@ use types::{
     ScoutProfile,
 };
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
 // Generated client stub for the progress contract — used to resolve a player's
 // current level at read time.  `level` is never stored in this contract.
@@ -474,6 +474,45 @@ impl RegistrationContract {
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Ed25519 signature helpers (#1156)
+    //
+    // Calling env.crypto().ed25519_verify() directly on untrusted input traps
+    // the transaction (opaque host error) when the signature or key is malformed.
+    // Instead, callers MUST use safe_ed25519_verify() which:
+    //   1. Enforces exact byte lengths at the type level (BytesN<32>, BytesN<64>)
+    //   2. Is the single call site to upgrade when the SDK exposes a fallible
+    //      verify path (planned — until then BytesN types prevent length panics).
+    //
+    // address_to_ed25519_key() returns Err(InvalidInput) for contract addresses
+    // and muxed accounts instead of silently returning a zero key.
+    // -------------------------------------------------------------------------
+
+    /// Verify an Ed25519 signature. The BytesN<32> / BytesN<64> types enforce
+    /// exact key and signature lengths at the SDK level, preventing the
+    /// length-mismatch trap. Returns `Ok(())` on a valid signature.
+    ///
+    /// NOTE: The current Soroban SDK (25.x) does not expose a fallible
+    /// `try_ed25519_verify`; a wrong-key mismatch will still trap. This
+    /// function is the designated upgrade point when a fallible API is
+    /// available in a future SDK version. Callers should validate the
+    /// public key via `address_to_ed25519_key` before calling here so that
+    /// contract-address / muxed-account keys are rejected with a typed error
+    /// rather than a trap.
+    #[allow(dead_code)]
+    fn safe_ed25519_verify(
+        env: &Env,
+        public_key: &BytesN<32>,
+        message: &Bytes,
+        signature: &BytesN<64>,
+    ) -> Result<(), ScoutChainError> {
+        // BytesN<N> enforces length at compile time — no length-related trap.
+        // Wrong-key mismatch still traps in SDK 25.x; update this site when
+        // try_ed25519_verify() is exposed.
+        env.crypto().ed25519_verify(public_key, message, signature);
+        Ok(())
+    }
 
     fn require_initialized(env: &Env) -> Result<(), ScoutChainError> {
         if !env
