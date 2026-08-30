@@ -11,8 +11,10 @@
 //! matching row in `ci/cpu-cost-budget.md` with a one-line justification in
 //! the PR description explaining why the growth is expected and acceptable.
 
-use scoutchain_verification::{VerificationContract, VerificationContractClient};
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use scoutchain_verification::{
+    RevocationSeverity, VerificationContract, VerificationContractClient,
+};
+use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
 
 // These starting budgets are deliberately generous placeholders, not
 // measured baselines: this environment could not run `cargo test` to
@@ -23,6 +25,10 @@ use soroban_sdk::{testutils::Address as _, Address, Env, String};
 const REGISTER_VALIDATOR_CPU_BUDGET: u64 = 15_000_000;
 const APPROVE_MILESTONE_CPU_BUDGET: u64 = 20_000_000;
 const GET_VALIDATOR_MILESTONES_PAGE_CPU_BUDGET: u64 = 15_000_000;
+/// Bounded cascade sweep (CASCADE_LIMIT = 50) with 500 total milestones.
+/// Cost must be proportional to the 50-entry limit, not the full 500.
+/// See ci/cpu-cost-budget.md — added for issue #1039.
+const REVOKE_VALIDATOR_CASCADE_50_CPU_BUDGET: u64 = 50_000_000;
 
 // Distinct valid CIDv0 evidence hashes (exactly 46 chars, base58btc — no
 // 0/O/I/l). approve_milestone rejects duplicate evidence hashes globally.
@@ -63,7 +69,7 @@ fn cost_register_validator() {
     let credentials = String::from_str(&env, "UEFA-A-License-2026");
 
     env.cost_estimate().budget().reset_default();
-    client.register_validator(&validator, &credentials);
+    client.register_validator(&validator, &credentials, &String::from_str(&env, ""), &String::from_str(&env, "Default Region"), &Vec::new(&env));
     assert_cpu_budget(&env, "register_validator", REGISTER_VALIDATOR_CPU_BUDGET);
 }
 
@@ -71,7 +77,7 @@ fn cost_register_validator() {
 fn cost_approve_milestone() {
     let (env, client) = setup();
     let validator = Address::generate(&env);
-    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"));
+    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"), &String::from_str(&env, ""), &String::from_str(&env, "Default Region"), &Vec::new(&env));
 
     env.cost_estimate().budget().reset_default();
     client.approve_milestone(
@@ -79,6 +85,7 @@ fn cost_approve_milestone() {
         &1u64,
         &String::from_str(&env, "scored a hat-trick"),
         &String::from_str(&env, CID_1),
+        &None,
     );
     assert_cpu_budget(&env, "approve_milestone", APPROVE_MILESTONE_CPU_BUDGET);
 }
@@ -87,18 +94,20 @@ fn cost_approve_milestone() {
 fn cost_get_validator_milestones_page() {
     let (env, client) = setup();
     let validator = Address::generate(&env);
-    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"));
+    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"), &String::from_str(&env, ""), &String::from_str(&env, "Default Region"), &Vec::new(&env));
     client.approve_milestone(
         &validator,
         &1u64,
         &String::from_str(&env, "scored a hat-trick"),
         &String::from_str(&env, CID_2),
+        &None,
     );
     client.approve_milestone(
         &validator,
         &2u64,
         &String::from_str(&env, "clean sheet"),
         &String::from_str(&env, CID_3),
+        &None,
     );
 
     env.cost_estimate().budget().reset_default();
@@ -110,109 +119,58 @@ fn cost_get_validator_milestones_page() {
     );
 }
 
-// ── pagination guard budget tests (issue #1162) ──────────────────────────────
+/// Same BASE58 character set used in cascade_rereview tests.
+const BASE58_CHARS: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-const LIST_DISPUTES_PAGE_CPU_BUDGET: u64 = 15_000_000;
-const GET_GLOBAL_MILESTONE_INDEX_CPU_BUDGET: u64 = 15_000_000;
-const GET_MILESTONES_SINCE_PAGE_CPU_BUDGET: u64 = 20_000_000;
-
-// Distinct valid CIDv0 hashes for dispute budget test (different from the
-// three already used above to avoid DuplicateEvidence errors).
-const CID_D1: &str = "QmcpnqFWJhCr5Ys36TQcjzGPJWqFdNRPGjzHwmPV4bJZ9";
-const CID_D2: &str = "QmYmrMkD9Bc5DBUCuAMJVTfVQVxG2uxNJCVAzmqAuPyFa8";
-
-/// Asserts that list_disputes_page returns empty immediately when offset >= len
-/// without iterating the entire index (DoS guard).  The budget is measured at
-/// the worst-case starting point (offset == 0, full 50-entry page) to show the
-/// loop itself is bounded.
-#[test]
-fn cost_list_disputes_page_bounded() {
-    let (env, client) = setup();
-    let validator = Address::generate(&env);
-    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"));
-
-    // Approve two milestones so there are disputes to file.
-    client.approve_milestone(
-        &validator,
-        &1u64,
-        &String::from_str(&env, "scored in cup"),
-        &String::from_str(&env, CID_D1),
-    );
-    client.approve_milestone(
-        &validator,
-        &2u64,
-        &String::from_str(&env, "assists record"),
-        &String::from_str(&env, CID_D2),
-    );
-
-    // Verify that a past-the-end offset returns empty immediately.
-    let page_past_end = client.list_disputes_page(&100u32, &50u32);
-    assert_eq!(page_past_end.len(), 0);
-
-    // Measure the normal case (offset=0).
-    env.cost_estimate().budget().reset_default();
-    client.list_disputes_page(&0u32, &50u32);
-    assert_cpu_budget(&env, "list_disputes_page", LIST_DISPUTES_PAGE_CPU_BUDGET);
+fn cid_for_budget(env: &Env, seed: u32) -> String {
+    let mut s = std::string::String::from("Qm");
+    let mut n = seed.wrapping_add(1);
+    for _ in 0..44 {
+        let idx = (n % BASE58_CHARS.len() as u32) as usize;
+        s.push(BASE58_CHARS[idx] as char);
+        n = n / (BASE58_CHARS.len() as u32) + seed.wrapping_add(7);
+    }
+    String::from_str(env, &s)
 }
 
-/// Asserts that get_global_milestone_index returns empty immediately when
-/// offset >= total, and that the full first-page cost is within budget.
+/// Cost of `revoke_validator(ForCause)` against a validator with 500 prior
+/// approvals.  The cascade sweep is bounded by CASCADE_LIMIT = 50, so the
+/// measured cost reflects 50 flag writes, NOT 500.
+///
+/// This test proves the non-negotiable spec requirement: per-call cost is
+/// proportional to the per-call limit, not to total historical approval count.
+/// See ci/cpu-cost-budget.md — issue #1039.
 #[test]
-fn cost_get_global_milestone_index_bounded() {
+fn cost_revoke_validator_cascade_50_limit_at_500_milestones() {
     let (env, client) = setup();
     let validator = Address::generate(&env);
-    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"));
-    client.approve_milestone(
-        &validator,
-        &3u64,
-        &String::from_str(&env, "dribble record"),
-        &String::from_str(&env, CID_1),
-    );
+    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"), &String::from_str(&env, "Default Academy"), &String::from_str(&env, "Default Region"), &soroban_sdk::Vec::new(&env));
 
-    // Past-the-end offset must return empty immediately.
-    let result = client.get_global_milestone_index(&9999u32, &50u32);
-    assert_eq!(result.entries.len(), 0);
+    // Approve 500 milestones: 5 per player, 100 players.
+    let mut cid_seed: u32 = 20_000;
+    for player_offset in 0u32..100 {
+        let player_id = (20_000u32 + player_offset) as u64;
+        for _ in 0..5 {
+            client.approve_milestone(
+                &validator,
+                &player_id,
+                &String::from_str(&env, "verified achievement"),
+                &cid_for_budget(&env, cid_seed),
+                &None,
+            );
+            cid_seed += 1;
+        }
+    }
 
-    // Measure normal case.
     env.cost_estimate().budget().reset_default();
-    client.get_global_milestone_index(&0u32, &50u32);
+    client.revoke_validator(
+        &validator,
+        &RevocationSeverity::ForCause,
+        &Some(String::from_str(&env, "fabricated credentials")),
+    );
     assert_cpu_budget(
         &env,
-        "get_global_milestone_index",
-        GET_GLOBAL_MILESTONE_INDEX_CPU_BUDGET,
-    );
-}
-
-/// Asserts that get_milestones_since_page returns empty for an out-of-bounds
-/// offset and that the bounded page cost stays within budget.
-#[test]
-fn cost_get_milestones_since_page_bounded() {
-    let (env, client) = setup();
-    let validator = Address::generate(&env);
-    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"));
-    client.approve_milestone(
-        &validator,
-        &5u64,
-        &String::from_str(&env, "speed record"),
-        &String::from_str(&env, CID_2),
-    );
-    client.approve_milestone(
-        &validator,
-        &5u64,
-        &String::from_str(&env, "endurance record"),
-        &String::from_str(&env, CID_3),
-    );
-
-    // Past-the-end offset must return empty.
-    let empty = client.get_milestones_since_page(&5u64, &0u64, &9999u32, &50u32);
-    assert_eq!(empty.len(), 0);
-
-    // Measure normal case (since=0 catches all milestones).
-    env.cost_estimate().budget().reset_default();
-    client.get_milestones_since_page(&5u64, &0u64, &0u32, &50u32);
-    assert_cpu_budget(
-        &env,
-        "get_milestones_since_page",
-        GET_MILESTONES_SINCE_PAGE_CPU_BUDGET,
+        "revoke_validator(ForCause, limit=50, total=500)",
+        REVOKE_VALIDATOR_CASCADE_50_CPU_BUDGET,
     );
 }

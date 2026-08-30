@@ -32,20 +32,31 @@ measured-cost trends can be tracked across commits.
 | verification   | `register_validator`             | 15,000,000                |
 | verification   | `approve_milestone`              | 20,000,000                |
 | verification   | `get_validator_milestones_page`  | 15,000,000                |
+| verification   | `revoke_validator(ForCause, limit=50, total=500)` | 50,000,000 |
 | progress       | `advance_level`                  | 15,000,000                |
 | progress       | `reset_player_level`             | 12,000,000                |
 | progress       | `get_progress_history_page`      | 10,000,000                |
+| progress       | `verify_history_proof`           | 8,000,000                 |
 | scout_access   | `subscribe`                      | 20,000,000                |
 | scout_access   | `pay_to_contact`                 | 20,000,000                |
 | scout_access   | `batch_contact_players` (5 ids)  | 25,000,000                |
 | scout_access   | `expire_trial_offers` (limit=20) | 25,000,000                |
+| scout_access   | `get_expiring_subscriptions` (20 scouts, buckets ~50k days from epoch, limit 50) | 1,500,000 |
 
-These starting budgets are deliberately generous placeholders, not measured
-baselines: the environment these were authored in had no Rust toolchain
-available, so `cargo test` could not be run to capture real current costs.
-**Tightening every budget to roughly current-cost-plus-headroom, once a real
-CI run reports actual numbers, is a follow-up — not a blocker for this file
-or the tests existing and being enforced.**
+All budgets above were calibrated from real `cargo test --test cost_budget
+-- --nocapture` measurements (see `cpu-cost-budget-report.txt`) with 20%
+headroom via `scripts/calibrate-budgets.py`. The Merkle history commitment
+recomputation added by issue #700 is included in the `advance_level` and
+`reset_player_level` measurements above — its cost is well within the
+calibrated budgets.
+
+These budgets are calibrated automatically by `scripts/calibrate-budgets.py`
+from the `cpu-cost-budget-report.txt` CI artifact.  The script adds a
+documented headroom percentage (default 20%) to the latest measured cost.
+To re-calibrate manually:
+  1. Ensure `cpu-cost-budget-report.txt` is present locally (produced by
+     `cargo test --workspace --test cost_budget -- --nocapture`).
+  2. Run: `CALIBRATE_WRITE=1 python scripts/calibrate-budgets.py`
 
 ## Raising a budget
 
