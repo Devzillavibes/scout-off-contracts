@@ -32,10 +32,6 @@ const MAX_CREDENTIALS_LEN: u32 = 256;
 const MIN_CREDENTIALS_LEN: u32 = 10;
 const MAX_GLOBAL_MILESTONE_INDEX: u32 = 500;
 
-// Persistent storage TTL bump for milestone records.
-const PERSISTENT_TTL_MIN: u32 = 500;
-const PERSISTENT_TTL_MAX: u32 = 2_000;
-
 /// Maximum number of simultaneously registered validators.
 /// Increase requires a contract upgrade because the ValidatorVector entry
 /// is bounded by Soroban's 64 KB per-entry limit.
@@ -1046,7 +1042,13 @@ impl VerificationContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = open_index.len();
-        let cap = limit.min(50);
+        // Return empty immediately if offset is past the end — prevents a
+        // large-offset caller from iterating through the whole index before
+        // the while-loop condition fires (DoS-shaped under Soroban limits).
+        if offset >= total {
+            return Vec::new(&env);
+        }
+        let cap = limit.max(1).min(50);
         let mut page: Vec<(u64, u32)> = Vec::new(&env);
         let mut i = offset;
         while i < total && page.len() < cap {
@@ -1067,14 +1069,73 @@ impl VerificationContract {
             .get(&DataKey::GlobalMilestoneIndex)
             .unwrap_or_else(|| Vec::new(&env));
         let total = all.len();
+        // Return empty immediately if offset is past the end — mirrors the
+        // same guard added to list_disputes_page to prevent large-offset walks.
+        if offset >= total {
+            return GlobalMilestoneIndexPage {
+                entries: Vec::new(&env),
+                total,
+            };
+        }
         let mut entries = Vec::new(&env);
-        let cap = if limit > 50 { 50 } else { limit };
+        let cap = limit.max(1).min(50);
         let mut i = offset;
         while i < total && entries.len() < cap {
             entries.push_back(all.get(i).unwrap());
             i += 1;
         }
         GlobalMilestoneIndexPage { entries, total }
+    }
+
+    /// Return milestones for `player_id` approved at or after `since_timestamp`,
+    /// in a bounded page.
+    ///
+    /// This is the bounded replacement for an unbounded time-range scan:
+    /// - `limit` is capped at 50 entries per page (matching the rest of the
+    ///   pagination contract).
+    /// - `offset` is bounded against the player's milestone count so a large
+    ///   offset cannot drive an unbounded iteration loop.
+    /// - Returns milestones in approval order (oldest first within the page).
+    ///
+    /// Callers who want all milestones without a time filter should use
+    /// `get_milestone_count` + `get_milestone` directly.
+    pub fn get_milestones_since_page(
+        env: Env,
+        player_id: u64,
+        since_timestamp: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Milestone> {
+        let counter_key = DataKey::MilestoneCounter(player_id);
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&counter_key)
+            .unwrap_or(0u32);
+
+        // Bound offset against the collection length before any iteration.
+        if offset >= count || count == 0 {
+            return Vec::new(&env);
+        }
+
+        let cap = limit.max(1).min(50);
+        let mut page: Vec<Milestone> = Vec::new(&env);
+        let mut i = offset + 1; // milestone indices are 1-based
+        let end = count + 1;    // exclusive upper bound (1-based)
+
+        while i < end && page.len() < cap {
+            if let Some(m) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Milestone>(&DataKey::Milestone(player_id, i))
+            {
+                if m.approved_at >= since_timestamp {
+                    page.push_back(m);
+                }
+            }
+            i += 1;
+        }
+        page
     }
 
     pub fn get_validator(env: Env, wallet: Address) -> Result<Validator, VerificationError> {

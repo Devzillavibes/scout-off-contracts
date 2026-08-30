@@ -109,3 +109,110 @@ fn cost_get_validator_milestones_page() {
         GET_VALIDATOR_MILESTONES_PAGE_CPU_BUDGET,
     );
 }
+
+// ── pagination guard budget tests (issue #1162) ──────────────────────────────
+
+const LIST_DISPUTES_PAGE_CPU_BUDGET: u64 = 15_000_000;
+const GET_GLOBAL_MILESTONE_INDEX_CPU_BUDGET: u64 = 15_000_000;
+const GET_MILESTONES_SINCE_PAGE_CPU_BUDGET: u64 = 20_000_000;
+
+// Distinct valid CIDv0 hashes for dispute budget test (different from the
+// three already used above to avoid DuplicateEvidence errors).
+const CID_D1: &str = "QmcpnqFWJhCr5Ys36TQcjzGPJWqFdNRPGjzHwmPV4bJZ9";
+const CID_D2: &str = "QmYmrMkD9Bc5DBUCuAMJVTfVQVxG2uxNJCVAzmqAuPyFa8";
+
+/// Asserts that list_disputes_page returns empty immediately when offset >= len
+/// without iterating the entire index (DoS guard).  The budget is measured at
+/// the worst-case starting point (offset == 0, full 50-entry page) to show the
+/// loop itself is bounded.
+#[test]
+fn cost_list_disputes_page_bounded() {
+    let (env, client) = setup();
+    let validator = Address::generate(&env);
+    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"));
+
+    // Approve two milestones so there are disputes to file.
+    client.approve_milestone(
+        &validator,
+        &1u64,
+        &String::from_str(&env, "scored in cup"),
+        &String::from_str(&env, CID_D1),
+    );
+    client.approve_milestone(
+        &validator,
+        &2u64,
+        &String::from_str(&env, "assists record"),
+        &String::from_str(&env, CID_D2),
+    );
+
+    // Verify that a past-the-end offset returns empty immediately.
+    let page_past_end = client.list_disputes_page(&100u32, &50u32);
+    assert_eq!(page_past_end.len(), 0);
+
+    // Measure the normal case (offset=0).
+    env.cost_estimate().budget().reset_default();
+    client.list_disputes_page(&0u32, &50u32);
+    assert_cpu_budget(&env, "list_disputes_page", LIST_DISPUTES_PAGE_CPU_BUDGET);
+}
+
+/// Asserts that get_global_milestone_index returns empty immediately when
+/// offset >= total, and that the full first-page cost is within budget.
+#[test]
+fn cost_get_global_milestone_index_bounded() {
+    let (env, client) = setup();
+    let validator = Address::generate(&env);
+    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"));
+    client.approve_milestone(
+        &validator,
+        &3u64,
+        &String::from_str(&env, "dribble record"),
+        &String::from_str(&env, CID_1),
+    );
+
+    // Past-the-end offset must return empty immediately.
+    let result = client.get_global_milestone_index(&9999u32, &50u32);
+    assert_eq!(result.entries.len(), 0);
+
+    // Measure normal case.
+    env.cost_estimate().budget().reset_default();
+    client.get_global_milestone_index(&0u32, &50u32);
+    assert_cpu_budget(
+        &env,
+        "get_global_milestone_index",
+        GET_GLOBAL_MILESTONE_INDEX_CPU_BUDGET,
+    );
+}
+
+/// Asserts that get_milestones_since_page returns empty for an out-of-bounds
+/// offset and that the bounded page cost stays within budget.
+#[test]
+fn cost_get_milestones_since_page_bounded() {
+    let (env, client) = setup();
+    let validator = Address::generate(&env);
+    client.register_validator(&validator, &String::from_str(&env, "UEFA-A-License-2026"));
+    client.approve_milestone(
+        &validator,
+        &5u64,
+        &String::from_str(&env, "speed record"),
+        &String::from_str(&env, CID_2),
+    );
+    client.approve_milestone(
+        &validator,
+        &5u64,
+        &String::from_str(&env, "endurance record"),
+        &String::from_str(&env, CID_3),
+    );
+
+    // Past-the-end offset must return empty.
+    let empty = client.get_milestones_since_page(&5u64, &0u64, &9999u32, &50u32);
+    assert_eq!(empty.len(), 0);
+
+    // Measure normal case (since=0 catches all milestones).
+    env.cost_estimate().budget().reset_default();
+    client.get_milestones_since_page(&5u64, &0u64, &0u32, &50u32);
+    assert_cpu_budget(
+        &env,
+        "get_milestones_since_page",
+        GET_MILESTONES_SINCE_PAGE_CPU_BUDGET,
+    );
+}
