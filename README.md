@@ -565,13 +565,31 @@ Contract test coverage:
 
 ## MVP Scope
 
-The initial testnet MVP focuses on a single end-to-end flow:
+The contracts shipped on testnet cover the following capabilities. This section reflects what is **currently implemented** in the contract source. It aligns with the Features list above and the checked items in the Roadmap below.
 
-1. One player registers a profile → contract stores identity and IPFS links at Level 0
-2. One validator approves a milestone → progress updates to Level 1 or 2 on-chain
-3. One scout pays to contact the player → fee settles in XLM, contact details unlocked
+### Shipped contract features
 
-Secondary features (fractionalized sponsorship, oracle integrations, advanced filtering) ship in subsequent milestones.
+- **Player & scout registration** — on-chain identity, IPFS hash storage, duplicate prevention, field validation
+- **Validator registry** — admin-controlled register / revoke lifecycle, credential storage, validator-cap enforcement
+- **Four-tier progress levels** — Unverified → VerifiedIdentity → PerformanceMilestones → EliteTier state machine with immutable on-chain history
+- **Milestone approval** — validators confirm achievements with on-chain evidence hashes; cross-contract call atomically advances player level
+- **Scout subscriptions** — Basic / Pro / Elite tiers with XLM fee settlement, expiry enforcement, downgrade guard, and auto-renewal
+- **Pay-to-contact** — scouts pay a micro-fee to unlock contact details; duplicate-contact prevention; fee accumulation
+- **Trial offer logging** — Elite-tier scouts record trial offers on-chain, advancing the player to Level 3 (EliteTier)
+- **Admin controls** — fee-config management, fee withdrawal, and a contract-level circuit breaker (pause / unpause) on all four contracts
+- **Event emission** — structured events for off-chain indexing on every state-changing operation
+- **Deployment tooling** — build, deploy, initialize, cross-contract wiring, TypeScript binding generation, and one-command testnet setup
+- **Backend schema** — PostgreSQL migration for the event-indexer backend
+
+### Not yet started (future milestones)
+
+The following are tracked in the Roadmap but have **no contract code today**:
+
+- Fractionalized Player Token sponsorship model
+- Decentralized oracle integration for physical stats
+- Mobile-first Flutter frontend
+- Security audit
+- Mainnet launch
 
 ## Roadmap
 
