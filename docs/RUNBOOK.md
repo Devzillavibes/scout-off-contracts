@@ -1,511 +1,433 @@
-# ScoutChain Operations Runbook
+# ScoutChain Runbook
 
-This document covers day-to-day operational procedures for the four ScoutChain
-Soroban contracts: **registration**, **verification**, **progress**, and
-**scout_access**. Use it for health monitoring, incident response, fee
-management, validator administration, and common troubleshooting.
+Operational procedures for the ScoutChain platform.
 
 ---
 
-## Table of Contents
+## Emergency: Pause All Contracts
 
-1. [Health Checks](#health-checks)
-2. [Contract Pause / Unpause (Circuit Breaker)](#contract-pause--unpause-circuit-breaker)
-3. [Validator Administration](#validator-administration)
-4. [Fee Management](#fee-management)
-5. [Scout Subscriptions](#scout-subscriptions)
-6. [Cross-Contract Wiring Verification](#cross-contract-wiring-verification)
-7. [Incident Response](#incident-response)
-8. [Common Error Codes](#common-error-codes)
-9. [Runbook Checklist — Deployment Day](#runbook-checklist--deployment-day)
+Use this procedure when a security incident requires immediately halting all
+state-changing contract operations (e.g. a critical bug is being actively
+exploited).
 
----
+### Prerequisites
 
-## Health Checks
-
-Call `health()` on each contract to confirm it is initialized and report its
-operational state.  The function returns a `ContractHealth` object with **three
-fields**:
-
-| Field | Type | Meaning |
-|-------|------|---------|
-| `initialized` | `bool` | Contract has been initialized via `initialize()` |
-| `paused` | `bool` | Global circuit breaker is active — all state-changing calls will fail |
-| `pay_to_contact_paused` | `bool` | Pay-to-contact function is individually paused (`scout_access` only; always `false` for the other three contracts) |
-
-### registration
+- `ADMIN_SECRET` — the Stellar secret key for the platform admin account.
+- `SOROBAN_RPC_URL` and `STELLAR_NETWORK` set in your environment (or `.env`).
+- All four contract IDs available in `.env.contracts`.
 
 ```bash
-stellar contract invoke \
-  --id $REGISTRATION_CONTRACT_ID \
-  --network testnet \
+# Load environment variables
+source .env
+source .env.contracts
+```
+
+### One-command pause script
+
+Run ./scripts/emergency-pause.sh
+
+> **Note**: Each `pause_contract` call is a separate Stellar transaction.
+> If the script exits mid-way (e.g. network error), run it again — the already-
+> paused contracts will return `ContractPaused` but will not change state.
+> Continue from the failed contract manually if needed.
+```
+
+## Function-Scoped Circuit Breakers
+
+### When to Use `pause_approve_milestone` Instead of `pause_contract`
+
+**Use `pause_approve_milestone` if:**
+- Only milestone approval has been compromised or has a bug
+- Validators are being investigated; don't block validator registration/revocation
+- Cross-contract issue with progress contract; other verification logic is fine
+
+**Use `pause_contract` (whole contract) if:**
+- Multiple functions are affected
+- Vulnerability is in core contract logic, not a specific function
+- Need immediate shutdown of all state changes
+
+### Example: Validator Collusion Incident
+
+```bash
+# 1. Pause only approve_milestone while investigation continues
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- pause_approve_milestone
+
+# 2. Continue validator operations (registration, revocation)
+# 3. Query health to confirm state
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   -- health
+
+# 4. Once investigation complete, unpause
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- unpause_approve_milestone
 ```
 
-**Expected output (healthy, running normally)**
+### When to Use `pause_pay_to_contact` Instead of `pause_contract`
 
-```json
-{
-  "initialized": true,
-  "paused": false,
-  "pay_to_contact_paused": false
-}
-```
+**Use `pause_pay_to_contact` if:**
+- Fee-charging `pay_to_contact` has been compromised or has a bug
+- Need to halt contact fees while keeping scout operations (subscribe, renew, read state) running
+- Cross-contract issue affecting payments but not scout admin functions
 
-**Expected output (contract globally paused)**
+**Use `pause_contract` (whole contract) if:**
+- Multiple functions are affected
+- Core contract logic vulnerability
+- Need immediate shutdown of all state changes
 
-```json
-{
-  "initialized": true,
-  "paused": true,
-  "pay_to_contact_paused": false
-}
-```
-
-> `pay_to_contact_paused` is always `false` for the registration contract —
-> it has no pay-to-contact function.
-
----
-
-### verification
+### Example: Payment Issue Incident
 
 ```bash
-stellar contract invoke \
-  --id $VERIFICATION_CONTRACT_ID \
-  --network testnet \
+# 1. Pause only pay_to_contact while investigation continues
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- pause_pay_to_contact
+
+# 2. Continue scout operations (subscribe, renew, read state)
+# 3. Query health to confirm state
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
   -- health
+
+# 4. Once investigation complete, unpause
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- unpause_pay_to_contact
 ```
 
-**Expected output (healthy, running normally)**
+### Monitoring
+
+Subscribe to events to detect and verify pause state changes:
+
+- `approve_milestone_paused` — Function-scoped pause for verify activated
+- `approve_milestone_unpaused` — Function-scoped pause for verify lifted
+- `pay_to_contact_paused` — Function-scoped pause for scout_access activated
+- `pay_to_contact_unpaused` — Function-scoped pause for scout_access lifted
+- `contract_paused` — Whole-contract pause (overrides function-scoped state)
+```
+
+### Manual pause (contract by contract)
+
+If you prefer to pause contracts individually:
+
+```bash
+source .env && source .env.contracts
+NETWORK_ARGS="--network $STELLAR_NETWORK --source $ADMIN_SECRET"
+
+stellar contract invoke --id "$REGISTRATION_CONTRACT_ID" $NETWORK_ARGS -- pause_contract
+stellar contract invoke --id "$VERIFICATION_CONTRACT_ID" $NETWORK_ARGS -- pause_contract
+stellar contract invoke --id "$PROGRESS_CONTRACT_ID"     $NETWORK_ARGS -- pause_contract
+stellar contract invoke --id "$SCOUT_ACCESS_CONTRACT_ID" $NETWORK_ARGS -- pause_contract
+```
+
+### Verify each contract is paused
+
+After pausing, confirm `health().paused == true` for all four contracts:
+
+```bash
+source .env && source .env.contracts
+NETWORK_ARGS="--network $STELLAR_NETWORK --source $ADMIN_SECRET"
+
+echo "registration:" && stellar contract invoke --id "$REGISTRATION_CONTRACT_ID" $NETWORK_ARGS -- health
+echo "verification:" && stellar contract invoke --id "$VERIFICATION_CONTRACT_ID" $NETWORK_ARGS -- health
+echo "progress:"     && stellar contract invoke --id "$PROGRESS_CONTRACT_ID"     $NETWORK_ARGS -- health
+echo "scout_access:" && stellar contract invoke --id "$SCOUT_ACCESS_CONTRACT_ID" $NETWORK_ARGS -- health
+```
+
+Expected output for each contract:
 
 ```json
-{
-  "initialized": true,
-  "paused": false,
-  "pay_to_contact_paused": false
-}
+{"initialized":true,"paused":true}
 ```
 
-**Expected output (contract globally paused)**
+A `"paused":false` response means that contract was not successfully paused —
+re-run the pause command for that contract before proceeding.
+
+---
+
+## Rehearse Routine Admin Rotation
+
+Use `scripts/rehearse-admin-rotation.sh` to rehearse the two-step
+`propose_admin` → `accept_admin` rotation procedure on a **disposable**
+local or testnet deployment before performing it against a real shared
+testnet or mainnet contract.
+
+This is the **routine, happy-path** counterpart to the tabletop exercise in
+[Emergency: Admin Key Loss / Compromise](#emergency-admin-key-loss--compromise)
+above. That exercise rehearses the failure scenario; this one rehearses the
+normal, successful procedure so operators have practised it at least once
+before they need to do it for real (e.g. onboarding a new platform operator,
+rotating keys after a team member leaves, or regular security hygiene).
+
+### When to run this
+
+- Before performing a routine admin rotation on a shared testnet for the
+  first time.
+- Before performing a rotation on mainnet.
+- Any time the rotation procedure in `ai.md` or `docs/DEPLOYMENT.md` is
+  updated — re-run to confirm the new steps still work end-to-end.
+- As part of onboarding a new operator who will be responsible for admin
+  rotations.
+
+### Prerequisites
+
+- `stellar-cli` installed at the pinned version (see `docs/CONTRIBUTING.md`).
+- A running local Soroban quickstart sandbox **or** testnet access with
+  funded accounts.
+- For local: start the sandbox first (see `docs/DEPLOYMENT.md` or the
+  `bindings-smoke-test` CI job for the exact `docker run` command).
+
+### Run the rehearsal
+
+```bash
+# Against the local quickstart sandbox (default):
+bash scripts/rehearse-admin-rotation.sh local
+
+# Against Stellar testnet (will request funding via friendbot):
+bash scripts/rehearse-admin-rotation.sh testnet
+```
+
+The script:
+1. Generates two fresh ephemeral Stellar identities (`OLD_ADMIN` and `NEW_ADMIN`).
+2. Funds both via friendbot.
+3. Builds and deploys a fresh, isolated set of all four contracts.
+4. Initialises them with `OLD_ADMIN`.
+5. For each contract, performs `propose_admin(NEW_ADMIN)` then `accept_admin()`.
+6. Verifies `NEW_ADMIN` can call `pause_contract` / `unpause_contract`
+   (admin-only operations) after the rotation.
+7. Verifies `OLD_ADMIN` is correctly rejected from admin-only operations.
+8. Cleans up the ephemeral identities.
+
+A `PASS` result means the full rotation procedure worked end-to-end on a
+real Soroban contract deployment and you are ready to perform the same
+steps on your intended target.
+
+### After a successful rehearsal
+
+When you are ready to rotate on a real deployment:
+
+```bash
+# Load the real contract IDs
+source .env.contracts
+
+# --- On the CURRENT admin machine: ---
+stellar contract invoke --id "$REGISTRATION_CONTRACT_ID" \
+  --source "$CURRENT_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- propose_admin --new_admin "$NEW_ADMIN_ADDRESS"
+
+stellar contract invoke --id "$VERIFICATION_CONTRACT_ID" \
+  --source "$CURRENT_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- propose_admin --new_admin "$NEW_ADMIN_ADDRESS"
+
+stellar contract invoke --id "$PROGRESS_CONTRACT_ID" \
+  --source "$CURRENT_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- propose_admin --new_admin "$NEW_ADMIN_ADDRESS"
+
+stellar contract invoke --id "$SCOUT_ACCESS_CONTRACT_ID" \
+  --source "$CURRENT_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- propose_admin --new_admin "$NEW_ADMIN_ADDRESS"
+
+# --- On the NEW admin machine (the incoming operator): ---
+stellar contract invoke --id "$REGISTRATION_CONTRACT_ID" \
+  --source "$NEW_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- accept_admin
+
+stellar contract invoke --id "$VERIFICATION_CONTRACT_ID" \
+  --source "$NEW_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- accept_admin
+
+stellar contract invoke --id "$PROGRESS_CONTRACT_ID" \
+  --source "$NEW_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- accept_admin
+
+stellar contract invoke --id "$SCOUT_ACCESS_CONTRACT_ID" \
+  --source "$NEW_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- accept_admin
+```
+
+> **Note**: `propose_admin` stores the proposed address on-chain. The current
+> admin retains all privileges until `accept_admin` is called from the new
+> address — the rotation is not complete until both steps succeed on every
+> contract. Confirm with `health()` and a test admin call after each
+> `accept_admin` to ensure the contract is live and the new key works.
+
+### Scope
+
+This procedure covers the **routine, non-emergency rotation**. For the
+scenario where the current admin key is lost or compromised and cannot sign
+`propose_admin`, see
+[Emergency: Admin Key Loss / Compromise](#emergency-admin-key-loss--compromise).
+
+---
+
+## Post-Incident Recovery: Unpause All Contracts
+
+Only unpause after the root cause has been confirmed as fixed or mitigated.
+
+### One-command unpause script
+
+Run the emergency unpause script:
+
+```bash
+./scripts/emergency-unpause.sh
+```
+
+### Verify each contract is unpaused
+
+```bash
+source .env && source .env.contracts
+NETWORK_ARGS="--network $STELLAR_NETWORK --source $ADMIN_SECRET"
+
+echo "registration:" && stellar contract invoke --id "$REGISTRATION_CONTRACT_ID" $NETWORK_ARGS -- health
+echo "verification:" && stellar contract invoke --id "$VERIFICATION_CONTRACT_ID" $NETWORK_ARGS -- health
+echo "progress:"     && stellar contract invoke --id "$PROGRESS_CONTRACT_ID"     $NETWORK_ARGS -- health
+echo "scout_access:" && stellar contract invoke --id "$SCOUT_ACCESS_CONTRACT_ID" $NETWORK_ARGS -- health
+```
+
+Expected output for each contract after a successful unpause:
 
 ```json
-{
-  "initialized": true,
-  "paused": true,
-  "pay_to_contact_paused": false
-}
-```
-
-> `pay_to_contact_paused` is always `false` for the verification contract —
-> it has no pay-to-contact function.
-
----
-
-### progress
-
-```bash
-stellar contract invoke \
-  --id $PROGRESS_CONTRACT_ID \
-  --network testnet \
-  -- health
-```
-
-**Expected output (healthy, running normally)**
-
-```json
-{
-  "initialized": true,
-  "paused": false,
-  "pay_to_contact_paused": false
-}
-```
-
-**Expected output (contract globally paused)**
-
-```json
-{
-  "initialized": true,
-  "paused": true,
-  "pay_to_contact_paused": false
-}
-```
-
-> `pay_to_contact_paused` is always `false` for the progress contract —
-> it has no pay-to-contact function.
-
----
-
-### scout_access
-
-```bash
-stellar contract invoke \
-  --id $SCOUT_ACCESS_CONTRACT_ID \
-  --network testnet \
-  -- health
-```
-
-**Expected output (healthy, running normally)**
-
-```json
-{
-  "initialized": true,
-  "paused": false,
-  "pay_to_contact_paused": false
-}
-```
-
-**Expected output (contract globally paused)**
-
-```json
-{
-  "initialized": true,
-  "paused": true,
-  "pay_to_contact_paused": false
-}
-```
-
-**Expected output (pay-to-contact individually paused, global circuit breaker off)**
-
-```json
-{
-  "initialized": true,
-  "paused": false,
-  "pay_to_contact_paused": true
-}
-```
-
-**Expected output (both paused)**
-
-```json
-{
-  "initialized": true,
-  "paused": true,
-  "pay_to_contact_paused": true
-}
-```
-
-> `pay_to_contact_paused` reflects the function-scoped pause for
-> `pay_to_contact` in the `scout_access` contract. It is independent of the
-> global `paused` flag — one can be true while the other is false.
-
----
-
-### Automated health sweep (all four contracts)
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-source .env.contracts   # loads REGISTRATION_CONTRACT_ID, etc.
-
-NETWORK=${STELLAR_NETWORK:-testnet}
-CONTRACTS=(
-  "registration:$REGISTRATION_CONTRACT_ID"
-  "verification:$VERIFICATION_CONTRACT_ID"
-  "progress:$PROGRESS_CONTRACT_ID"
-  "scout_access:$SCOUT_ACCESS_CONTRACT_ID"
-)
-
-for entry in "${CONTRACTS[@]}"; do
-  name="${entry%%:*}"
-  id="${entry##*:}"
-  echo "=== $name ==="
-  stellar contract invoke --id "$id" --network "$NETWORK" -- health
-  echo ""
-done
-```
-
-Any contract that returns `"initialized": false` has not been set up. Run
-`./scripts/initialize.sh` to fix it. Any contract with `"paused": true` is in
-circuit-breaker mode — see [Contract Pause / Unpause](#contract-pause--unpause-circuit-breaker).
-
----
-
-## Contract Pause / Unpause (Circuit Breaker)
-
-All four contracts support an emergency circuit breaker. When paused, every
-state-changing call (registration, milestone approval, subscription purchase,
-etc.) fails with error `9 ContractPaused`. Query calls (`get_player`,
-`health`, etc.) continue to work.
-
-### Pause a contract
-
-```bash
-stellar contract invoke \
-  --id $REGISTRATION_CONTRACT_ID \
-  --source-account $ADMIN_ADDRESS \
-  --network testnet \
-  -- pause_contract
-```
-
-Repeat with `VERIFICATION_CONTRACT_ID`, `PROGRESS_CONTRACT_ID`, and
-`SCOUT_ACCESS_CONTRACT_ID` as needed.
-
-### Unpause a contract
-
-```bash
-stellar contract invoke \
-  --id $REGISTRATION_CONTRACT_ID \
-  --source-account $ADMIN_ADDRESS \
-  --network testnet \
-  -- unpause_contract
-```
-
-### Verify pause state
-
-Use `health()` — `"paused": true` confirms the contract is paused:
-
-```json
-{
-  "initialized": true,
-  "paused": true,
-  "pay_to_contact_paused": false
-}
+{"initialized":true,"paused":false}
 ```
 
 ---
 
-## Validator Administration
+## Emergency: Admin Key Loss / Compromise
 
-### Register a new validator
+Every admin-gated function in every contract — `pause_contract`,
+`upgrade`, `propose_admin`/`accept_admin`, `set_progress_contract`,
+`update_fee_config`, `revoke_validator`, and so on — requires
+`require_auth()` from the single address stored as `Admin`. There is no
+on-chain fallback if that key is unrecoverable: Soroban has no
+social-recovery or governance primitive to fall back to, and the two-step
+`propose_admin` / `accept_admin` rotation still requires the *current*
+admin to sign the first step. This is the scenario one level worse than
+"we need to pause a buggy contract" (see the pause procedure above): here,
+the team cannot even issue that first `pause_contract` call.
 
-```bash
-stellar contract invoke \
-  --id $VERIFICATION_CONTRACT_ID \
-  --source-account $ADMIN_ADDRESS \
-  --network testnet \
-  -- register_validator \
-  --wallet GVALIDATOR_ADDRESS \
-  --credentials "Academy Director, FC Example"
-```
+For response-time expectations and incident-severity guidance, see
+[`SECURITY.md#emergency-response-immediate-mitigation`](../SECURITY.md#emergency-response-immediate-mitigation).
 
-### Revoke a validator
+This section assumes the multisig/timelock admin work tracked in
+[issue #609](https://github.com/scout-off/scout-off-contracts/issues/609)
+has not shipped yet — once it has, this single-key failure mode mostly goes
+away, which is exactly why that issue should be prioritized (see "Prevention"
+below).
 
-```bash
-stellar contract invoke \
-  --id $VERIFICATION_CONTRACT_ID \
-  --source-account $ADMIN_ADDRESS \
-  --network testnet \
-  -- revoke_validator \
-  --wallet GVALIDATOR_ADDRESS
-```
+### Step 1 — Decide which scenario you're in
 
-### Check validator status
+This determines everything else, so establish it first:
 
-```bash
-stellar contract invoke \
-  --id $VERIFICATION_CONTRACT_ID \
-  --network testnet \
-  -- is_active_validator \
-  --wallet GVALIDATOR_ADDRESS
-```
+| Signal | Scenario |
+|---|---|
+| The secret key/hardware wallet is destroyed or was never backed up; no unauthorized transactions have occurred | **Lost** — no attacker |
+| Unexpected admin transactions appear (validator revocations, fee changes, an `upgrade()` you didn't initiate, an unfamiliar `propose_admin`) | **Compromised** — active attacker |
+| You're not sure | Treat it as **Compromised** until proven otherwise — the cost of over-reacting (an unnecessary migration) is far lower than the cost of under-reacting to an active attacker |
 
-Returns `true` if active, `false` if revoked or not registered.
+### Scenario A — Key merely lost (no attacker)
 
----
+No one can act maliciously, but no one can act at all either: the admin
+address is frozen exactly as it was at the moment of loss. Concretely:
 
-## Fee Management
+- If the contract was **unpaused** when the key was lost, it keeps running
+  normally forever, just without any admin lever (no more validator
+  changes, fee updates, or upgrades — ever, on this contract instance).
+- If the contract was **paused** when the key was lost, it is now
+  **permanently paused** — this is the worst version of this scenario,
+  since the contract is fully inert with no path back.
 
-### Check accumulated platform fees
+There is no urgency to warn users publicly (nothing is actively being
+misused), but the platform has permanently lost the ability to operate that
+contract. The only way out is the address-migration procedure in Scenario B
+— run it on your own timeline rather than under incident pressure.
 
-```bash
-stellar contract invoke \
-  --id $SCOUT_ACCESS_CONTRACT_ID \
-  --network testnet \
-  -- get_accumulated_fees
-```
+### Scenario B — Key compromised (active attacker)
 
-Returns the total stroops (1 XLM = 10,000,000 stroops) collected and pending
-withdrawal.
+The attacker now holds sole admin rights. They can revoke every validator,
+rewrite fee config, propose (and, from a second address they also control,
+accept) a new admin, or push a malicious `upgrade()` — and the legitimate
+team **cannot call `pause_contract` to stop any of it**, because that also
+requires the now-compromised admin key.
 
-### Withdraw fees to treasury
+Since the contract itself cannot be locked down, mitigation has to happen
+around it:
 
-```bash
-stellar contract invoke \
-  --id $SCOUT_ACCESS_CONTRACT_ID \
-  --source-account $ADMIN_ADDRESS \
-  --network testnet \
-  -- withdraw_fees \
-  --to GTREASURY_ADDRESS
-```
+1. **Public announcement, immediately.** Tell users the admin key for
+   contract ID `$COMPROMISED_ID` is compromised and the contract should be
+   considered abandoned as of now. Include the exact contract ID — this is
+   the only thing that unambiguously identifies which deployment is unsafe.
+2. **Client-side blocklisting.** The frontend and backend (both outside
+   this repo) must stop reading from and writing to the compromised
+   contract ID immediately — this is the only real "circuit breaker" left
+   once `pause_contract` is unavailable. Coordination points to hand to
+   those teams:
+   - The exact compromised contract ID(s) (`REGISTRATION_CONTRACT_ID` /
+     `VERIFICATION_CONTRACT_ID` / `PROGRESS_CONTRACT_ID` /
+     `SCOUT_ACCESS_CONTRACT_ID` — whichever is affected; a compromised
+     `progress` admin key is the scenario this issue was filed against,
+     but the same procedure applies to any of the four).
+   - A hard denylist entry so no client library, wallet integration, or
+     cached config can silently fall back to the old ID.
+   - Confirmation once the new contract (below) is live, so clients can
+     cut over.
+3. **Execute the address-migration procedure now**, treating it as the
+   incident response rather than routine maintenance:
+   [DEPLOYMENT.md — Address migration (new contract ID)](DEPLOYMENT.md#address-migration-new-contract-id).
+   That procedure's own step 3 ("pause the old contract") is **not
+   possible** here — skip it and rely entirely on step 1 (public
+   announcement) and client-side blocklisting for containment instead.
+   Tooling to make this migration itself less manual is tracked in
+   [issue #617](https://github.com/scout-off/scout-off-contracts/issues/617);
+   until that lands, follow the manual steps in `DEPLOYMENT.md` directly.
+4. **Replay state into the new contract** from the off-chain indexer's
+   event log (DEPLOYMENT.md step 4), and audit that log for any
+   attacker-issued transactions so they aren't replayed into the new
+   deployment.
 
-### Update fee configuration
+### Prevention
 
-```bash
-stellar contract invoke \
-  --id $SCOUT_ACCESS_CONTRACT_ID \
-  --source-account $ADMIN_ADDRESS \
-  --network testnet \
-  -- update_fee_config \
-  --fee_config '{
-    "contact_fee_stroops": 100000,
-    "basic_sub_stroops": 1000000,
-    "pro_sub_stroops": 3000000,
-    "elite_sub_stroops": 7000000,
-    "sub_duration_secs": 2592000
-  }'
-```
+Both scenarios exist only because each contract has exactly one admin
+key with no fallback. This is the strongest possible argument for
+prioritizing [issue #609 — multisig/timelock admin
+authorization](https://github.com/scout-off/scout-off-contracts/issues/609):
+a threshold scheme turns "one lost or stolen key" into "an attacker or
+accident needs to compromise/lose a quorum of keys," and a timelock gives
+the team a window to react to a malicious pending action (e.g. a proposed
+`upgrade()`) before it takes effect — neither of which the current
+single-key model provides.
 
----
+### Tabletop exercise (rehearse this without an actual key loss)
 
-## Scout Subscriptions
+Run this against a disposable local or testnet deployment — never against
+a shared testnet or mainnet contract other people rely on.
 
-### Check a scout's subscription
-
-```bash
-stellar contract invoke \
-  --id $SCOUT_ACCESS_CONTRACT_ID \
-  --network testnet \
-  -- get_subscription \
-  --scout GSCOUT_ADDRESS
-```
-
-Returns the subscription record including tier, `subscribed_at`, and
-`expires_at` timestamps.
-
-### Check if a scout has contacted a player
-
-```bash
-stellar contract invoke \
-  --id $SCOUT_ACCESS_CONTRACT_ID \
-  --network testnet \
-  -- has_contacted \
-  --scout GSCOUT_ADDRESS \
-  --player_id 42
-```
-
----
-
-## Cross-Contract Wiring Verification
-
-The verification contract cross-calls the progress contract inside
-`approve_milestone`. This link must be set once after deployment.
-
-### Check if the link is set
-
-```bash
-stellar contract invoke \
-  --id $VERIFICATION_CONTRACT_ID \
-  --network testnet \
-  -- get_progress_contract
-```
-
-If this returns an address, the link is active. If it errors or returns empty,
-run the wiring step.
-
-### Re-wire the cross-contract link
-
-```bash
-stellar contract invoke \
-  --id $VERIFICATION_CONTRACT_ID \
-  --source-account $ADMIN_ADDRESS \
-  --network testnet \
-  -- set_progress_contract \
-  --progress_contract $PROGRESS_CONTRACT_ID
-```
-
-**Symptom when missing**: Validators can call `approve_milestone` successfully
-(the milestone is recorded) but the player's progress level never advances.
-Check `get_milestone_count(player_id)` vs `get_level(player_id)` to diagnose.
+- [ ] Deploy a fresh set of four contracts (`./scripts/deploy.sh testnet`)
+      and initialize them (`./scripts/initialize.sh testnet`) with a
+      throwaway admin identity.
+- [ ] Simulate "key lost" by discarding the throwaway identity's secret
+      (e.g. remove it from `stellar keys` / your signer) without pausing
+      first.
+- [ ] Confirm `pause_contract`, `propose_admin`, and `upgrade` all fail as
+      expected without that identity available — this is the state the
+      real incident would put you in.
+- [ ] Walk through the address-migration procedure end to end
+      (`DEPLOYMENT.md`) against this disposable deployment, skipping the
+      "pause the old contract" step to mirror Scenario B.
+- [ ] Confirm the new contract is initialized, wired, and reachable, and
+      that a client pointed at the new contract ID works while the old ID
+      returns only its frozen, final state.
+- [ ] Time the exercise. If any step took noticeably longer than expected
+      or required improvising commands not in this doc, update this
+      runbook and `DEPLOYMENT.md` with what you learned before the next
+      drill.
+- [ ] Confirm every participant knows, without looking it up, who has
+      authority to make the public-announcement call in a real incident —
+      this should never be discovered for the first time during a real
+      compromise.
 
 ---
 
-## Incident Response
+## Related Documentation
 
-### Scenario: Suspicious milestone approvals
-
-1. Pause the verification contract immediately:
-   ```bash
-   stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
-     --source-account $ADMIN_ADDRESS --network testnet -- pause_contract
-   ```
-2. Identify the validator wallet involved via on-chain `milestone_approved` events.
-3. Revoke the validator:
-   ```bash
-   stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
-     --source-account $ADMIN_ADDRESS --network testnet \
-     -- revoke_validator --wallet GSUSPECT_VALIDATOR
-   ```
-4. Investigate milestones using `get_milestone(player_id, index)`.
-5. Unpause when the situation is resolved.
-
-### Scenario: Pay-to-contact exploit suspected
-
-1. Pause only the pay-to-contact function on `scout_access` without disrupting
-   subscriptions or trial offers by setting `pay_to_contact_paused`:
-   ```bash
-   stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
-     --source-account $ADMIN_ADDRESS --network testnet \
-     -- pause_pay_to_contact
-   ```
-   After this, `health()` returns:
-   ```json
-   {
-     "initialized": true,
-     "paused": false,
-     "pay_to_contact_paused": true
-   }
-   ```
-2. Review `player_contacted` events from Horizon for anomalous patterns.
-3. Resume pay-to-contact when the investigation is complete:
-   ```bash
-   stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
-     --source-account $ADMIN_ADDRESS --network testnet \
-     -- unpause_pay_to_contact
-   ```
-
-### Scenario: Contract not initialized
-
-`health()` returns `"initialized": false`. Run the full initialization:
-
-```bash
-./scripts/initialize.sh testnet
-```
-
-Or initialize the specific contract manually:
-
-```bash
-stellar contract invoke \
-  --id $REGISTRATION_CONTRACT_ID \
-  --source-account $ADMIN_ADDRESS \
-  --network testnet \
-  -- initialize \
-  --admin $ADMIN_ADDRESS
-```
-
----
-
-## Common Error Codes
-
-| Code | Error | Description | Resolution |
-|------|-------|-------------|------------|
-| 1 | `AlreadyInitialized` | `initialize()` called twice | No action; contract is already ready |
-| 2 | `NotInitialized` | Operations before setup | Call `initialize()` first |
-| 3 | `PlayerNotFound` | Invalid `player_id` | Verify player ID from registration tx |
-| 4 | `ValidatorNotAuthorized` | Caller not a registered validator | Admin must call `register_validator` |
-| 5 | `InvalidProgressTransition` | Level skip or backward transition | Follow the valid transition table |
-| 6 | `ScoutNotSubscribed` | Scout accessing talent pool without subscription | Call `subscribe()` first |
-| 7 | `InsufficientFee` | Payment below required amount | Check fees via `get_fee_config()` |
-| 8 | `AlreadyRegistered` | Duplicate wallet registration | Use existing player or scout ID |
-| 9 | `ContractPaused` | Circuit breaker active | Wait for admin to unpause; see `health()` |
-| 10 | `Unauthorized` | Wrong account for admin operation | Use the correct admin Stellar account |
-| 11 | `Overflow` | Arithmetic overflow in fee calculation | Use amounts within safe `i128` range |
-
----
-
-## Runbook Checklist — Deployment Day
-
-Use this list after every fresh deployment to testnet or mainnet.
-
-- [ ] All four contracts deployed — IDs written to `.env.contracts`
-- [ ] All four `health()` calls return `{"initialized": true, "paused": false, "pay_to_contact_paused": false}`
-- [ ] Cross-contract link set: `verification → progress` via `set_progress_contract`
-- [ ] Validators registered for demo data
-- [ ] Fee configuration verified via `get_fee_config()`
-- [ ] Testnet seed run (if applicable): `./testnet/seed.sh`
-- [ ] TypeScript bindings regenerated: `./scripts/generate-bindings.sh testnet`
-- [ ] Database migration applied: `psql $DATABASE_URL -f migrations/001_initial_schema.sql`
-- [ ] End-to-end smoke test: register player → approve milestone → check progress level
-
----
-
-*Last updated: 2026-08-30*
+- [DEPLOYMENT.md](DEPLOYMENT.md) — contract deployment order and initialization
+- [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md) — full `pause_contract` / `unpause_contract` / `health` function reference
+- [GLOSSARY.md](GLOSSARY.md) — domain term definitions
+- [Issue #609](https://github.com/scout-off/scout-off-contracts/issues/609) — multisig/timelock admin authorization (the preventive fix for this section)
+- [Issue #617](https://github.com/scout-off/scout-off-contracts/issues/617) — tooling for the address-migration procedure this section relies on
