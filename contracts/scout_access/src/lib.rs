@@ -249,7 +249,7 @@ impl ScoutAccessContract {
             }
         }
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         let fee = match &tier {
             SubscriptionTier::Basic => config.basic_sub_stroops,
             SubscriptionTier::Pro => config.pro_sub_stroops,
@@ -308,7 +308,7 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::AlreadyContacted);
         }
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         Self::collect_fee(&env, &scout, config.contact_fee_stroops)?;
 
         env.storage().persistent().set(&contact_key, &true);
@@ -358,7 +358,7 @@ impl ScoutAccessContract {
         scout.require_auth();
         Self::require_active_subscription(&env, &scout)?;
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         let mut new_contacts: u32 = 0;
 
         // First pass: count new (uncharged) contacts to compute total fee.
@@ -537,7 +537,7 @@ impl ScoutAccessContract {
         Ok(sub)
     }
 
-    pub fn get_fee_config(env: Env) -> FeeConfig {
+    pub fn get_fee_config(env: Env) -> Result<FeeConfig, ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         Self::fee_config(&env)
     }
@@ -760,11 +760,11 @@ impl ScoutAccessContract {
         Ok(sub)
     }
 
-    fn fee_config(env: &Env) -> FeeConfig {
+    fn fee_config(env: &Env) -> Result<FeeConfig, ScoutAccessError> {
         env.storage()
             .instance()
             .get(&DataKey::FeeConfig)
-            .expect("fee config not set")
+            .ok_or(ScoutAccessError::NotInitialized)
     }
 
     fn accumulate_fee(env: &Env, amount: i128) -> Result<(), ScoutAccessError> {
