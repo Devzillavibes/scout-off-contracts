@@ -136,10 +136,13 @@ pub fn register_validator(
     env: Env,
     wallet: Address,
     credentials: String,
+    affiliation: String,
+    specializations: Vec<String>,
 ) -> Result<(), VerificationError>
 
-// severity is explicit: RevocationSeverity::Routine (no cascade) or RevocationSeverity::ForCause (cascade flags all prior milestones)
-// reason is optional — pass None to omit a revocation reason
+// `affiliation` is the canonical org identifier used for diversity gating;
+// `specializations` are optional category tags such as "physical-stats" or "identity-kyc"
+// that must match the milestone category when nested category gating is active.
 pub fn revoke_validator(
     env: Env,
     wallet: Address,
@@ -156,7 +159,7 @@ pub fn batch_revoke_validators(
 
 pub fn batch_register_validators(
     env: Env,
-    entries: Vec<(Address, String)>,
+    entries: Vec<(Address, String, String, Vec<String>)>,
 ) -> Result<(), VerificationError>
 
 pub fn restore_validator(env: Env, wallet: Address) -> Result<(), VerificationError>

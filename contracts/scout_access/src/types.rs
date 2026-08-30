@@ -196,6 +196,10 @@ pub enum DataKey {
     /// Proposed fee configuration awaiting activation after a 7-day delay
     PendingFeeConfig,
     AccumulatedFees,
+    /// Track the total XLM in escrow across all outstanding trial offers.
+    /// Incremented on log_trial_offer, decremented on all escrow release paths.
+    /// Used by withdraw_fees to ensure AccumulatedFees does not exceed balance - EscrowedTotal.
+    EscrowedTotal,
     /// Native XLM token contract address
     XlmToken,
     /// scout wallet → Subscription
