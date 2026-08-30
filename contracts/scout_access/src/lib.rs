@@ -388,11 +388,23 @@ impl ScoutAccessContract {
     // Pay-to-contact
     // -------------------------------------------------------------------------
 
-    /// Helper: check Pro tier contact quota with a specific count (batch support).
-    fn check_pro_contact_quota_with_count(
+    /// Unified Pro-tier quota helper: check, period-rollover, and increment.
+    ///
+    /// Called by both `pay_to_contact` (n=1) and `batch_contact_players`
+    /// (n=batch size) so the renewal-aware quota logic lives in exactly one
+    /// place.
+    ///
+    /// - If the scout is not Pro tier, returns `Ok(())` immediately.
+    /// - Detects subscription renewal by comparing `period_start` against the
+    ///   current `subscribed_at`; resets the counter to zero on a new period.
+    /// - Checks `current_count + n <= pro_contact_limit`.
+    /// - Writes the updated `ProContactPeriod` back to persistent storage.
+    ///
+    /// Returns `ContactQuotaExceeded` when the limit would be exceeded.
+    fn check_and_reserve_pro_quota(
         env: &Env,
         scout: &Address,
-        requested: u32,
+        n: u32,
     ) -> Result<(), ScoutAccessError> {
         let sub: Subscription = env
             .storage()
@@ -400,43 +412,50 @@ impl ScoutAccessContract {
             .get(&DataKey::Subscription(scout.clone()))
             .ok_or(ScoutAccessError::ScoutNotSubscribed)?;
 
-        // Only Pro tier has a quota
+        // Only Pro tier has a per-period quota.
         if sub.tier != SubscriptionTier::Pro {
             return Ok(());
         }
 
-        const SECONDS_PER_MONTH: u64 = 2_592_000;
-        let month_bucket = sub.subscribed_at / SECONDS_PER_MONTH;
-
-        let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
-        let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
-
         let config = Self::fee_config(env);
         let limit = config.pro_contact_limit;
 
-        if current.saturating_add(requested) > limit {
+        let period_key = DataKey::ProContactCount(scout.clone());
+        let period: ProContactPeriod = env
+            .storage()
+            .persistent()
+            .get(&period_key)
+            .unwrap_or(ProContactPeriod {
+                period_start: sub.subscribed_at,
+                count: 0,
+            });
+
+        // Detect period rollover: if the stored period_start predates the
+        // current subscription start, the scout renewed — reset to zero.
+        let current_count = if period.period_start == sub.subscribed_at {
+            period.count
+        } else {
+            0u32
+        };
+
+        if current_count.saturating_add(n) > limit {
             return Err(ScoutAccessError::ContactQuotaExceeded);
         }
 
+        let new_period = ProContactPeriod {
+            period_start: sub.subscribed_at,
+            count: current_count
+                .checked_add(n)
+                .ok_or(ScoutAccessError::Overflow)?,
+        };
+        env.storage().persistent().set(&period_key, &new_period);
+        env.storage().persistent().extend_ttl(
+            &period_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
         Ok(())
-    }
-
-    /// Helper: increment contact count for Pro tier scouts.
-    fn increment_contact_count(env: &Env, scout: &Address) {
-        Self::increment_contact_count_by(env, scout, 1)
-    }
-
-    /// Helper: increment contact count by N for Pro tier scouts (batch support).
-    fn increment_contact_count_by(env: &Env, scout: &Address, count: u32) {
-        const SECONDS_PER_MONTH: u64 = 2_592_000;
-        let now = env.ledger().timestamp();
-        let month_bucket = now / SECONDS_PER_MONTH;
-
-        let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
-        let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .set(&quota_key, &(current.saturating_add(count)));
     }
 
     /// Pay a micro-fee to unlock a player's contact details.
@@ -447,7 +466,7 @@ impl ScoutAccessContract {
     /// 3. Write contact record to persistent storage (prevents duplicate contacts).
     ///
     /// Scout must have an active, non-expired subscription.
-    /// Pro tier scouts are limited to `pro_contact_limit` contacts per month.
+    /// Pro tier scouts are limited to `pro_contact_limit` contacts per subscription period.
     pub fn pay_to_contact(
         env: Env,
         scout: Address,
@@ -467,11 +486,6 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::SubscriptionExpired);
         }
 
-        // Pro-tier quota is enforced below via `ProContactCount`, which resets
-        // on subscription renewal (issue #19). `check_pro_contact_quota` uses
-        // a wall-clock month bucket instead and would reject a call before the
-        // renewal-aware check below gets a chance to run, so it isn't used here.
-
         let contact_key = DataKey::ContactRecord(player_id, scout.clone());
         if env.storage().persistent().has(&contact_key) {
             return Err(ScoutAccessError::AlreadyContacted);
@@ -479,45 +493,12 @@ impl ScoutAccessContract {
 
         let config = Self::fee_config(&env);
 
-        // Pro-tier quota enforcement: limit contacts to pro_contact_limit per
-        // subscription period.  The counter resets automatically on renewal
-        // because a new period_start is stored when the scout subscribes again.
-        if subscription.tier == SubscriptionTier::Pro {
-            let period_key = DataKey::ProContactCount(scout.clone());
-            let period: ProContactPeriod =
-                env.storage()
-                    .persistent()
-                    .get(&period_key)
-                    .unwrap_or(ProContactPeriod {
-                        period_start: subscription.subscribed_at,
-                        count: 0,
-                    });
-            // If the stored period_start predates the current subscription,
-            // treat the counter as zero (subscription was renewed).
-            let current_count = if period.period_start == subscription.subscribed_at {
-                period.count
-            } else {
-                0u32
-            };
-            if current_count >= config.pro_contact_limit {
-                return Err(ScoutAccessError::ProContactLimitReached);
-            }
-            let new_period = ProContactPeriod {
-                period_start: subscription.subscribed_at,
-                count: current_count
-                    .checked_add(1)
-                    .ok_or(ScoutAccessError::Overflow)?,
-            };
-            env.storage().persistent().set(&period_key, &new_period);
-            env.storage().persistent().extend_ttl(
-                &period_key,
-                PERSISTENT_TTL_MIN,
-                PERSISTENT_TTL_MAX,
-            );
-        }
+        // Unified Pro-tier quota: check limit and increment in one place.
+        // Delegates period-rollover detection and counter write to the shared
+        // helper so single-contact and batch-contact paths are identical.
+        Self::check_and_reserve_pro_quota(&env, &scout, 1)?;
 
         Self::collect_fee(&env, &scout, config.contact_fee_stroops)?;
-        Self::increment_contact_count(&env, &scout);
 
         let record = ContactRecord {
             player_id,
@@ -612,8 +593,10 @@ impl ScoutAccessContract {
             return Ok(0);
         }
 
-        // Check quota with the count we're about to add
-        Self::check_pro_contact_quota_with_count(&env, &scout, new_contacts)?;
+        // Unified Pro-tier quota: check limit and increment atomically for
+        // the entire batch in one call. Uses the same renewal-aware logic as
+        // pay_to_contact (n=1) via the shared helper.
+        Self::check_and_reserve_pro_quota(&env, &scout, new_contacts)?;
 
         // Single token transfer for all new contacts combined.
         let total_fee = config
@@ -679,8 +662,6 @@ impl ScoutAccessContract {
 
             events::player_contacted(&env, player_id, &scout, config.contact_fee_stroops);
         }
-
-        Self::increment_contact_count_by(&env, &scout, new_contacts);
 
         env.storage().persistent().extend_ttl(
             &DataKey::Subscription(scout.clone()),
@@ -1949,9 +1930,9 @@ mod tests {
         client.pay_to_contact(&scout, &2u64);
         client.pay_to_contact(&scout, &3u64);
 
-        // Fourth contact must be rejected with ProContactLimitReached (#19).
+        // Fourth contact must be rejected with ContactQuotaExceeded (#1161 unification).
         let res = client.try_pay_to_contact(&scout, &4u64);
-        assert_eq!(res, Err(Ok(ScoutAccessError::ProContactLimitReached)));
+        assert_eq!(res, Err(Ok(ScoutAccessError::ContactQuotaExceeded)));
     }
 
     #[test]
@@ -2030,7 +2011,7 @@ mod tests {
         client.pay_to_contact(&scout, &4u64);
         assert_eq!(
             client.try_pay_to_contact(&scout, &5u64),
-            Err(Ok(ScoutAccessError::ProContactLimitReached))
+            Err(Ok(ScoutAccessError::ContactQuotaExceeded))
         );
     }
 
