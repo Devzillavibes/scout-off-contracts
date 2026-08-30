@@ -36,3 +36,17 @@ pub fn scout_verified(env: &Env, scout_id: u64, wallet: &Address) {
         scout_id,
     );
 }
+
+pub fn scout_deactivated(env: &Env, scout_id: u64, wallet: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "scout_deactivated"), wallet.clone()),
+        scout_id,
+    );
+}
+
+pub fn scout_reactivated(env: &Env, scout_id: u64, wallet: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "scout_reactivated"), wallet.clone()),
+        scout_id,
+    );
+}

@@ -102,4 +102,14 @@ pub enum DataKey {
     /// Used by `filter_players` for combined level+region queries so only
     /// matching players are loaded, avoiding a full scan of `PlayerIndex`.
     PlayersByLevelRegion(ProgressLevel, String),
+    /// Flag indicating a scout has been administratively deactivated.
+    ScoutDeactivated(u64),
+}
+
+/// Status of a scout as returned by `get_scout_status`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScoutStatus {
+    Active,
+    Deactivated,
 }

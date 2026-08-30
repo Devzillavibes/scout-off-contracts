@@ -6,7 +6,7 @@ mod types;
 use errors::ScoutChainError;
 use types::{
     ContractHealth, DataKey, PlayerProfile, PlayerSummary, PlayerVitals, ProgressLevel,
-    ScoutProfile,
+    ScoutProfile, ScoutStatus,
 };
 
 use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
@@ -358,6 +358,61 @@ impl RegistrationContract {
             .set(&DataKey::Scout(scout_id), &profile);
         events::scout_verified(&env, scout_id, &profile.wallet);
         Ok(())
+    }
+
+    /// Deactivate a scout (admin only). Sets the `ScoutDeactivated` flag and
+    /// emits `scout_deactivated`. A deactivated scout should be blocked from
+    /// accessing scout_access contract functions (cross-check required there).
+    pub fn deactivate_scout(env: Env, scout_id: u64) -> Result<(), ScoutChainError> {
+        Self::require_admin(&env)?;
+        let profile: ScoutProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scout(scout_id))
+            .ok_or(ScoutChainError::ScoutNotFound)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ScoutDeactivated(scout_id), &true);
+        events::scout_deactivated(&env, scout_id, &profile.wallet);
+        Ok(())
+    }
+
+    /// Reactivate a previously deactivated scout (admin only). Clears the
+    /// `ScoutDeactivated` flag and emits `scout_reactivated`.
+    pub fn reactivate_scout(env: Env, scout_id: u64) -> Result<(), ScoutChainError> {
+        Self::require_admin(&env)?;
+        let profile: ScoutProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scout(scout_id))
+            .ok_or(ScoutChainError::ScoutNotFound)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ScoutDeactivated(scout_id));
+        events::scout_reactivated(&env, scout_id, &profile.wallet);
+        Ok(())
+    }
+
+    /// Returns the activation status of a scout.
+    /// Returns `ScoutStatus::Deactivated` if `deactivate_scout` has been called
+    /// and not yet reversed by `reactivate_scout`. Returns `ScoutStatus::Active`
+    /// otherwise. Returns `ScoutNotFound` if the scout_id does not exist.
+    pub fn get_scout_status(env: Env, scout_id: u64) -> Result<ScoutStatus, ScoutChainError> {
+        let _: ScoutProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scout(scout_id))
+            .ok_or(ScoutChainError::ScoutNotFound)?;
+        let deactivated = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ScoutDeactivated(scout_id))
+            .unwrap_or(false);
+        if deactivated {
+            Ok(ScoutStatus::Deactivated)
+        } else {
+            Ok(ScoutStatus::Active)
+        }
     }
 
     pub fn get_player_count(env: Env) -> u64 {
