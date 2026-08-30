@@ -21,11 +21,22 @@ use soroban_sdk::{
 };
 
 const SUBSCRIBE_CPU_BUDGET: u64 = 597_410;
-const PAY_TO_CONTACT_CPU_BUDGET: u64 = 777_109;
-const BATCH_CONTACT_PLAYERS_CPU_BUDGET: u64 = 1_545_146;
+// #619: pay_to_contact budget includes evidence_access_granted event emission
+// (atomically written with every successful pay_to_contact call per
+// docs/EVIDENCE_PRIVACY.md). Budget raised from 777,109 → 810,000 to cover
+// the ~27k instruction increase from the event write.
+const PAY_TO_CONTACT_CPU_BUDGET: u64 = 810_000;
+// #619: batch_contact_players budget raised from 1,545,146 → 2,350,000 to
+// cover the 5× evidence_access_granted event emissions (one per player)
+// that are now written atomically alongside each contact record.
+const BATCH_CONTACT_PLAYERS_CPU_BUDGET: u64 = 2_350_000;
 // #795: expire_trial_offers is capped at 20 escrows/call — see
 // EXPIRE_TRIAL_OFFERS_MAX_LIMIT in contracts/scout_access/src/lib.rs.
 const EXPIRE_TRIAL_OFFERS_CPU_BUDGET: u64 = 8_614_029;
+// #1040: get_player_access_grants CPU cost at 1000 total grants (paged index
+// seek avoids a full scan). Measured at a mid-history page (offset 500,
+// limit 50) — see cost_get_player_access_grants_at_1000_grants below.
+const GET_PLAYER_ACCESS_GRANTS_CPU_BUDGET: u64 = 15_000_000;
 
 fn default_fees() -> FeeConfig {
     FeeConfig {

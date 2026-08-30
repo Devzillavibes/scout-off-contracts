@@ -19,9 +19,9 @@ pub use errors::VerificationError;
 pub use types::{
     AttestationStatus, ContractHealth, DataKey, DiversityConfig, DisputeVote, GlobalMilestoneEntry,
     GlobalMilestoneIndexPage, JuryConfig, Milestone, MilestoneAttestation, MilestoneDispute,
-    MilestoneRef, MilestoneWithValidatorStatus, PendingMilestoneClaim, PendingVoteRef,
-    RevocationRecord, RevocationSeverity, Validator, ValidatorActivityReport, ValidatorStatus,
-    VerificationWiringState,
+    MilestoneRef, MilestoneRefPage, MilestoneWithValidatorStatus, PendingMilestoneClaim,
+    PendingVoteRef, RevocationRecord, RevocationSeverity, Validator, ValidatorActivityReport,
+    ValidatorPlayersPage, ValidatorStatus, VerificationWiringState,
 };
 
 use soroban_sdk::xdr::ToXdr;
@@ -2155,16 +2155,6 @@ impl VerificationContract {
             .unwrap_or(0u32)
     }
 
-    /// Return all distinct player IDs for which the given validator has approved
-    /// at least one milestone. The list is accumulated on every `approve_milestone`
-    /// call and each player_id appears at most once.
-    pub fn get_validator_players(env: Env, wallet: Address) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ValidatorPlayers(wallet))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
     /// Returns the number of currently active (non-revoked) validators.
     pub fn get_active_validator_count(env: Env) -> u32 {
         env.storage()
@@ -2332,6 +2322,10 @@ impl VerificationContract {
     /// Return a bounded page of milestones approved by `wallet`.
     ///
     /// `limit` is capped at 50 entries, matching `get_global_milestone_index`.
+    ///
+    /// > **Deprecated**: use [`get_validator_milestones_page_v2`] which returns a
+    /// [`MilestoneRefPage`] with a `total` field so callers know when to stop paging.
+    /// This function is retained for backward compatibility.
     pub fn get_validator_milestones_page(
         env: Env,
         wallet: Address,
@@ -2358,6 +2352,99 @@ impl VerificationContract {
             i += 1;
         }
         page
+    }
+
+    /// Return a bounded, paginated page of milestones approved by `wallet`,
+    /// together with the total milestone count for the validator.
+    ///
+    /// This is the canonical successor to both `get_validator_milestones`
+    /// (unbounded, deprecated) and `get_validator_milestones_page` (bounded
+    /// but no total).  Use this function for new callers — having `total`
+    /// lets a client know exactly when paging is complete without over-fetching.
+    ///
+    /// **Pagination**: `offset` is a zero-based item offset into the validator's
+    /// milestone list.  `limit` is capped at 50 entries per page, matching the
+    /// convention used by `get_global_milestone_index` and `list_disputes_page`.
+    ///
+    /// **Ordering**: entries are returned in approval order (oldest first),
+    /// exactly as they appear in `ValidatorMilestones` storage.
+    pub fn get_validator_milestones_page_v2(
+        env: Env,
+        wallet: Address,
+        offset: u32,
+        limit: u32,
+    ) -> MilestoneRefPage {
+        let key = DataKey::ValidatorMilestones(wallet);
+        let list: Vec<MilestoneRef> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !list.is_empty() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
+        let total = list.len();
+        let cap = limit.min(50);
+        let mut entries = Vec::new(&env);
+        let mut i = offset;
+        while i < total && entries.len() < cap {
+            entries.push_back(list.get(i).unwrap());
+            i += 1;
+        }
+        MilestoneRefPage { entries, total }
+    }
+
+    /// Return all distinct player IDs for which the given validator has approved
+    /// at least one milestone. The list is accumulated on every `approve_milestone`
+    /// call and each player_id appears at most once.
+    ///
+    /// > **Deprecated**: this legacy method is unbounded.  High-volume callers
+    /// should use [`get_validator_players_page`] to keep response sizes bounded.
+    pub fn get_validator_players(env: Env, wallet: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ValidatorPlayers(wallet))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return a bounded, paginated page of distinct player IDs for which
+    /// `wallet` has approved at least one milestone, together with the total
+    /// player count for the validator.
+    ///
+    /// This is the canonical paginated successor to the unbounded
+    /// `get_validator_players`.  The `total` field lets callers determine when
+    /// paging is complete without over-fetching.
+    ///
+    /// **Pagination**: `offset` is a zero-based item offset; `limit` is capped
+    /// at 50 entries per page, matching the convention used by
+    /// `get_global_milestone_index` and `get_validator_milestones_page_v2`.
+    ///
+    /// **Ordering**: entries are returned in the order in which the validator
+    /// first approved a milestone for each player (oldest first).
+    pub fn get_validator_players_page(
+        env: Env,
+        wallet: Address,
+        offset: u32,
+        limit: u32,
+    ) -> ValidatorPlayersPage {
+        let list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorPlayers(wallet))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = list.len();
+        let cap = limit.min(50);
+        let mut entries = Vec::new(&env);
+        let mut i = offset;
+        while i < total && entries.len() < cap {
+            entries.push_back(list.get(i).unwrap());
+            i += 1;
+        }
+        ValidatorPlayersPage { entries, total }
     }
 
     /// Return full milestone records for a validator across all players, page by page.

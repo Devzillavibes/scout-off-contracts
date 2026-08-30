@@ -109,6 +109,33 @@ pub struct GlobalMilestoneIndexPage {
     pub total: u32,
 }
 
+/// Paginated response for `get_validator_milestones_page` and the new
+/// `get_validator_players_page`.
+///
+/// Follows the same `{ entries, total }` convention as
+/// [`GlobalMilestoneIndexPage`] so callers have a consistent stop condition.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilestoneRefPage {
+    /// Page of milestone references, in approval order (oldest first).
+    pub entries: Vec<MilestoneRef>,
+    /// Total number of milestone references in the validator's list.
+    pub total: u32,
+}
+
+/// Paginated response for `get_validator_players_page`.
+///
+/// `entries` is a page of distinct player IDs for which the validator has
+/// approved at least one milestone; `total` is the size of the full list.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatorPlayersPage {
+    /// Page of distinct player IDs, in order of first approval.
+    pub entries: Vec<u64>,
+    /// Total number of distinct players in the validator's list.
+    pub total: u32,
+}
+
 /// A player-initiated dispute for a milestone.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]

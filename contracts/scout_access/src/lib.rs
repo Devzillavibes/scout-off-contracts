@@ -7,8 +7,8 @@ use types::{FeeConfigProposal, ProContactPeriod, ScoutAccessWiringState};
 
 pub use errors::ScoutAccessError;
 pub use types::{
-    ContactRecord, DataKey, FeeConfig, FeeConfigHistoryEntry, Subscription, SubscriptionTier,
-    TrialEscrow, TrialOffer,
+    ContactRecord, DataKey, EvidenceAccessGrant, FeeConfig, FeeConfigHistoryEntry, ScoutContactsPage,
+    Subscription, SubscriptionTier, TrialEscrow, TrialOffer,
 };
 
 use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
@@ -1914,6 +1914,9 @@ impl ScoutAccessContract {
     }
 
     /// Return all player_ids contacted by `scout` as an O(1) index lookup.
+    ///
+    /// > **Deprecated**: this legacy method is unbounded.  High-volume callers
+    /// should use [`get_scout_contacts_page`] to keep response sizes bounded.
     pub fn get_scout_contacts(env: Env, scout: Address) -> soroban_sdk::Vec<u64> {
         Self::bump_instance_ttl(&env);
         let key = DataKey::ScoutContacts(scout.clone());
@@ -1928,6 +1931,48 @@ impl ScoutAccessContract {
                 .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
         }
         list
+    }
+
+    /// Return a bounded, paginated page of player IDs contacted by `scout`,
+    /// together with the total number of contacts.
+    ///
+    /// This is the canonical paginated successor to the unbounded
+    /// `get_scout_contacts`.  The `total` field lets callers determine when
+    /// paging is complete without over-fetching.
+    ///
+    /// **Pagination**: `offset` is a zero-based item offset; `limit` is capped
+    /// at 50 entries per page, matching the convention used by
+    /// `get_global_milestone_index` and `get_validator_milestones_page_v2`.
+    ///
+    /// **Ordering**: entries are returned in contact order (oldest first).
+    pub fn get_scout_contacts_page(
+        env: Env,
+        scout: Address,
+        offset: u32,
+        limit: u32,
+    ) -> ScoutContactsPage {
+        Self::bump_instance_ttl(&env);
+        let key = DataKey::ScoutContacts(scout.clone());
+        let list: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if !list.is_empty() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
+        let total = list.len();
+        let cap = limit.min(50);
+        let mut entries: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+        let mut i = offset;
+        while i < total && entries.len() < cap {
+            entries.push_back(list.get(i).unwrap());
+            i += 1;
+        }
+        ScoutContactsPage { entries, total }
     }
 
     /// Return all scout addresses that have contacted `player_id` as an O(1)
@@ -3220,10 +3265,23 @@ mod tests {
         client.subscribe(&scout, &SubscriptionTier::Elite);
         client.pay_to_contact(&scout, &42u64);
 
+        // pay_to_contact emits two events in this order:
+        // 1. evidence_access_granted (EvidenceAccessGrant written atomically)
+        // 2. player_contacted
+        // Verify both events are present in the correct order.
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
             soroban_sdk::vec![
                 &env,
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, crate::events::EVIDENCE_ACCESS_GRANTED),
+                        scout.clone()
+                    )
+                        .into_val(&env),
+                    (42u64, SubscriptionTier::Elite).into_val(&env)
+                ),
                 (
                     contract_id.clone(),
                     (

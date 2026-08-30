@@ -2,6 +2,23 @@ use soroban_sdk::{contracttype, Address, String};
 
 pub use scoutchain_shared_types::WiringLink;
 
+/// Paginated response for `get_scout_contacts_page`.
+///
+/// Follows the `{ entries, total }` convention established by
+/// [`verification::GlobalMilestoneIndexPage`] so callers have a consistent
+/// stop condition when walking pages.
+///
+/// `entries` contains at most 50 player IDs per page; `total` is the full
+/// number of players the scout has ever contacted.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoutContactsPage {
+    /// Page of contacted player IDs, in contact order (oldest first).
+    pub entries: soroban_sdk::Vec<u64>,
+    /// Total number of players this scout has contacted.
+    pub total: u32,
+}
+
 /// Subscription tier for scouts
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
