@@ -136,24 +136,30 @@ pub fn register_validator(
     env: Env,
     wallet: Address,
     credentials: String,
+    affiliation: String,
+    specializations: Vec<String>,
 ) -> Result<(), VerificationError>
 
-// reason is optional — pass None to omit a revocation reason
+// `affiliation` is the canonical org identifier used for diversity gating;
+// `specializations` are optional category tags such as "physical-stats" or "identity-kyc"
+// that must match the milestone category when nested category gating is active.
 pub fn revoke_validator(
     env: Env,
     wallet: Address,
+    severity: RevocationSeverity,
     reason: Option<String>,
 ) -> Result<(), VerificationError>
 
 pub fn batch_revoke_validators(
     env: Env,
     wallets: Vec<Address>,
+    severity: RevocationSeverity,
     reason: Option<String>,
 ) -> Result<(), VerificationError>
 
 pub fn batch_register_validators(
     env: Env,
-    entries: Vec<(Address, String)>,
+    entries: Vec<(Address, String, String, Vec<String>)>,
 ) -> Result<(), VerificationError>
 
 pub fn restore_validator(env: Env, wallet: Address) -> Result<(), VerificationError>
@@ -306,21 +312,26 @@ pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ScoutAccessErr
 
 ## Cross-Contract Wiring
 
-Five links must be established after every fresh deployment. `initialize.sh` sets all five automatically. Run the diagnostic script to check which links are present:
+Eight peer-address links must be established after every fresh deployment. `initialize.sh` sets all eight automatically. Run the diagnostic script to check which links are present:
 
 ```bash
 ./scripts/verify-cross-contract-wiring.sh testnet
 ```
 
-### The five wiring links
+### The eight wiring links
 
 | # | Command | What it does |
 |---|---------|-------------|
 | 1 | `verification.set_progress_contract` | Allows `approve_milestone` to call `advance_level` |
-| 2 | `registration.set_progress_contract` | Allows `progress.reset_player_level` to sync level to registration |
-| 3 | `progress.set_verification_contract` | Whitelists verification as authorized caller of `advance_level` |
-| 4 | `progress.set_registration_contract` | Allows progress to call `set_player_level` on registration |
-| 5 | `scout_access.set_progress_contract` | Allows `confirm_trial_offer` to call `advance_level` for Level 3 |
+| 2 | `verification.set_registration_contract` | Allows the dispute-milestone wallet-to-`player_id` binding check |
+| 3 | `registration.set_progress_contract` | Lets `filter_players` resolve player levels at query time |
+| 4 | `progress.set_verification_contract` | Whitelists verification as authorized caller of `advance_level` |
+| 5 | `progress.set_registration_contract` | Allows progress to call `set_player_level` on registration |
+| 6 | `progress.set_scout_access_contract` | Whitelists scout_access as authorized caller of `advance_level` |
+| 7 | `scout_access.set_progress_contract` | Allows `confirm_trial_offer` to call `advance_level` for Level 3 |
+| 8 | `scout_access.set_registration_contract` | Pro-tier scout verification / Sybil gating lookups |
+
+This list matches what `scripts/verify-cross-contract-wiring.sh` checks and the "Full Picture" table in [`docs/WIRING_REGISTRY_DESIGN.md`](docs/WIRING_REGISTRY_DESIGN.md).
 
 ### Manual wiring commands
 
@@ -330,25 +341,40 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_progress_contract --progress_contract $PROGRESS_CONTRACT_ID
 
-# 2. Registration ← Progress
+# 2. Verification → Registration
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  --source $ADMIN_ADDRESS --network testnet \
+  -- set_registration_contract --reg_contract $REGISTRATION_CONTRACT_ID
+
+# 3. Registration → Progress
 stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_progress_contract --addr $PROGRESS_CONTRACT_ID
 
-# 3. Progress → Verification
+# 4. Progress → Verification
 stellar contract invoke --id $PROGRESS_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_verification_contract --addr $VERIFICATION_CONTRACT_ID
 
-# 4. Progress → Registration
+# 5. Progress → Registration
 stellar contract invoke --id $PROGRESS_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_registration_contract --addr $REGISTRATION_CONTRACT_ID
 
-# 5. Scout Access → Progress
+# 6. Progress → Scout Access
+stellar contract invoke --id $PROGRESS_CONTRACT_ID \
+  --source $ADMIN_ADDRESS --network testnet \
+  -- set_scout_access_contract --addr $SCOUT_ACCESS_CONTRACT_ID
+
+# 7. Scout Access → Progress
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_progress_contract --addr $PROGRESS_CONTRACT_ID
+
+# 8. Scout Access → Registration
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  --source $ADMIN_ADDRESS --network testnet \
+  -- set_registration_contract --addr $REGISTRATION_CONTRACT_ID
 ```
 
 > **Note:** `verification.set_progress_contract` is first-call-only and returns
@@ -471,7 +497,7 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 20 | `ProContactLimitReached` | Pro-tier scout hit per-period contact limit |
 | 21 | `PendingAdminNotSet` | `accept_admin` called without a prior `propose_admin` |
 | 22 | `TrialOfferAlreadyConfirmed` | `confirm_trial_offer` called twice for same offer |
-| 23 | `TrialOfferExpired` | `confirm_trial_offer` called after offer expiry window |
+| 23 | `TrialOfferExpired` | Legacy compatibility code; expiry confirmation now commits the refund and returns success |
 
 > **Note:** Code 13 is intentionally reserved in `ScoutAccessError` and must not be assigned.
 
@@ -507,12 +533,30 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
    ```bash
    ./scripts/verify-cross-contract-wiring.sh testnet
    ```
-   It checks all five documented wiring links: `verification.set_progress_contract`, `registration.set_progress_contract`, `progress.set_verification_contract`, `progress.set_registration_contract`, and `scout_access.set_progress_contract`.
+   It checks all eight documented wiring links: `verification.set_progress_contract`, `verification.set_registration_contract`, `registration.set_progress_contract`, `progress.set_verification_contract`, `progress.set_registration_contract`, `progress.set_scout_access_contract`, `scout_access.set_progress_contract`, and `scout_access.set_registration_contract`.
 2. Re-wire if any link shows ❌:
    ```bash
    ./scripts/initialize.sh testnet
    ```
 3. Retry the original transaction — because `ProgressCallFailed` aborts the whole transaction, there is no partial state to clean up.
+
+> **Retry only the original entry point, never `advance_level` directly (Issue #811 follow-up).**
+> `progress.advance_level` is **not** internally idempotent. It is a monotonic state-machine step: it reads the current level, computes `next()`, and appends a history entry. It does **not** key off `milestone_ref`, so calling it twice with the *same* `milestone_ref` advances two tiers and writes two history entries that are indistinguishable from a legitimate double advance.
+>
+> Retry is safe **only** because each production caller holds its own dedup key and the whole transaction reverts on failure:
+> - `verification.approve_milestone` → `DataKey::EvidenceUsed(evidence_hash)` (returns `DuplicateEvidence`, code 16)
+> - `scout_access.confirm_trial_offer` → `DataKey::ConfirmationNonce(...)` / absent `TrialEscrow` (returns `TrialOfferAlreadyConfirmed`, code 22)
+>
+> Because the failed attempt reverts, its dedup key is rolled back too, so the retry proceeds exactly once. An operator or new contract that calls `progress.advance_level` directly gets **no such protection** and must supply its own dedup key. Any new whitelisted caller of `advance_level` must do the same.
+>
+> Bounded blast radius: a replay can over-advance by at most three tiers; once at `EliteTier` further calls fail closed with `AlreadyAtMaxLevel` and write nothing. On the secondary (`scout_access`) path, a `milestone_ref` of `0` or one beyond the verification contract's real milestone count is rejected with `InvalidProgressTransition` (#457). Both are verified in `contracts/progress/tests/issue_811_idempotency.rs`.
+
+> **Tested guarantee (Issue #811):** This all-or-nothing claim is backed by adversarial tests, not just this prose explanation. See:
+> - `contracts/verification/tests/adversarial_atomicity.rs` — proves `approve_milestone` behavior on bad-wired progress contract and validates the `DuplicateEvidence` idempotency token as defense-in-depth.
+> - `contracts/scout_access/tests/adversarial_atomicity.rs` — equivalent tests for `confirm_trial_offer`, including the `TrialOfferAlreadyConfirmed` double-confirm guard.
+> - `contracts/progress/tests/issue_811_idempotency.rs` — audits the shared `advance_level` call target itself: pins the non-idempotent double-apply behaviour, proves rejected calls leave no partial state, and proves the `AlreadyAtMaxLevel` / `InvalidProgressTransition` fail-closed paths.
+>
+> **Idempotency defense-in-depth:** The `DuplicateEvidence` check (code 16) on `approve_milestone` acts as an explicit idempotency token: if a future refactor altered write ordering and partial state were committed, a retried call with the same evidence hash would return `DuplicateEvidence` rather than silently double-counting. For `confirm_trial_offer`, the absence of the `TrialEscrow` record (removed on first confirmation) serves the same purpose — a second call returns `TrialOfferAlreadyConfirmed` (code 22).
 
 ---
 
@@ -556,6 +600,8 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
 |-------|--------|------|-----------|
 | `contract_initialized` | event_name, admin (Address) | admin (Address) | ✅ |
 | `scout_subscribed` | event_name, scout (Address) | tier (SubscriptionTier), fee_paid (i128) | ✅ |
+| `subscription_created` | event_name, scout (Address) | tier (SubscriptionTier), subscribed_at (u64), expires_at (u64) | ✅ |
+| `subscription_renewed` | event_name, scout (Address) | tier (SubscriptionTier), subscribed_at (u64), expires_at (u64) | ✅ |
 | `player_contacted` | event_name, scout (Address) | player_id (u64), fee_paid (i128) | ✅ |
 | `trial_offer_logged` | event_name, scout (Address) | player_id (u64) | ✅ |
 | `trial_offer_confirmed` | event_name, scout (Address) | player_id (u64), index (u32) | ✅ |
@@ -578,7 +624,7 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
 
 - **Wiring must be re-run after every fresh deployment.** Contract IDs change on each deploy; old wiring references stale IDs.
 - **`initialize` is one-time per contract.** Calling it twice returns `AlreadyInitialized` (code 1). This is not an error — the contract is already ready.
-- **`revoke_validator` takes `Option<String>` for the reason.** Pass `None` if no reason is needed. The old signature without a reason parameter no longer exists.
+- **`revoke_validator` now takes an explicit `RevocationSeverity` as the second parameter.** Pass `RevocationSeverity::Routine` for a routine deactivation (no cascade) or `RevocationSeverity::ForCause` for a misconduct revocation that flags all prior milestone approvals as pending re-review. Pass `None` for reason if no reason is needed. The old single-`reason` signature no longer exists — update all callers. For validators with more than 50 prior approvals, call `continue_revocation_cascade(wallet)` (admin only) one or more times until the `revocation_cascade_complete` event is emitted.
 - **`log_trial_offer` does NOT immediately advance the player's level.** It records the offer and escrows a fee. Level advancement happens in `confirm_trial_offer`, which must be called by the player wallet.
 - **Trial offer two-step flow:** `log_trial_offer` (scout) → `confirm_trial_offer` (player). Missing the confirmation step means the player stays at Level 2.
 - **Admin rotation is two-step.** Current admin calls `propose_admin`, then the pending address calls `accept_admin`. The old admin remains active until acceptance.
@@ -586,6 +632,7 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
 - **Subscription tier check is enforced on-chain.** Basic scouts cannot call `pay_to_contact`. Elite is required for `log_trial_offer`.
 - **`filter_players` requires `offset` and `limit`.** The limit is capped at 50 server-side.
 - **`set_progress_contract` on verification is first-call-only.** Returns `AlreadyConfigured` (code 11) if called again. Use `update_progress_contract` to re-wire.
+- **`approve_milestone` stops working once k-of-n threshold mode is enabled.** Once an admin calls `set_milestone_threshold(n)` with `n >= 2`, both `approve_milestone` and `submit_attested_milestone` return `ThresholdModeRequiresAttestation` (code 28) for every subsequent call — all milestone submissions must go through `attest_milestone` instead. Call `get_milestone_threshold()` to check the current mode before integrating; a return value of `1` (the default) means single-signature mode is still active and `approve_milestone` works as normal. A return value of `2` or higher means every validator must call `attest_milestone` independently, and the milestone commits automatically once the threshold number of distinct active validators have voted for the same `(player_id, evidence_hash)` claim within the configured voting window.
 
 > **⚠️ Verify `log_trial_offer` behavior against the live contract before integrating.**
 > The documented two-step flow (`log_trial_offer` → `confirm_trial_offer`) and level-advancement mechanics in this file reflect the contract's *intended* behavior at the time of writing. However, on-chain behavior is the ultimate source of truth. Before building any integration that depends on trial offers, **call `log_trial_offer` on the target network (testnet/mainnet) with a test scout account and inspect the resulting transaction: confirm the offer is recorded, the fee is escrowed, and no level advancement occurs until `confirm_trial_offer` is called by the player.** Cross-reference the emitted `trial_offer_logged` event and the progress contract's state against this document. If the live contract diverges from the docs, the live contract wins — file an issue to update the docs, but code to the live behavior.
