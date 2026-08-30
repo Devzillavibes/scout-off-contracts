@@ -892,7 +892,7 @@ impl ScoutAccessContract {
     fn check_pro_contact_quota_with_count(
         env: &Env,
         scout: &Address,
-        requested: u32,
+        n: u32,
     ) -> Result<(), ScoutAccessError> {
         let sub: Subscription = env
             .storage()
@@ -900,7 +900,7 @@ impl ScoutAccessContract {
             .get(&DataKey::Subscription(scout.clone()))
             .ok_or(ScoutAccessError::ScoutNotSubscribed)?;
 
-        // Only Pro tier has a quota
+        // Only Pro tier has a per-period quota.
         if sub.tier != SubscriptionTier::Pro {
             return Ok(());
         }
@@ -931,25 +931,20 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::ProContactLimitReached);
         }
 
+        let new_period = ProContactPeriod {
+            period_start: sub.subscribed_at,
+            count: current_count
+                .checked_add(n)
+                .ok_or(ScoutAccessError::Overflow)?,
+        };
+        env.storage().persistent().set(&period_key, &new_period);
+        env.storage().persistent().extend_ttl(
+            &period_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
         Ok(())
-    }
-
-    /// Helper: increment contact count for Pro tier scouts.
-    fn increment_contact_count(env: &Env, scout: &Address) {
-        Self::increment_contact_count_by(env, scout, 1)
-    }
-
-    /// Helper: increment contact count by N for Pro tier scouts (batch support).
-    fn increment_contact_count_by(env: &Env, scout: &Address, count: u32) {
-        const SECONDS_PER_MONTH: u64 = 2_592_000;
-        let now = env.ledger().timestamp();
-        let month_bucket = now / SECONDS_PER_MONTH;
-
-        let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
-        let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .set(&quota_key, &(current.saturating_add(count)));
     }
 
     /// Write an `EvidenceAccessGrant(player_id, scout)` and append `scout` to
@@ -1037,11 +1032,6 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::SubscriptionExpired);
         }
 
-        // Pro-tier quota is enforced below via `ProContactCount`, which resets
-        // on subscription renewal (issue #19). `check_pro_contact_quota` uses
-        // a wall-clock month bucket instead and would reject a call before the
-        // renewal-aware check below gets a chance to run, so it isn't used here.
-
         let contact_key = DataKey::ContactRecord(player_id, scout.clone());
         if env.storage().persistent().has(&contact_key) {
             return Err(ScoutAccessError::AlreadyContacted);
@@ -1085,7 +1075,6 @@ impl ScoutAccessContract {
         }
 
         Self::collect_fee(&env, &scout, config.contact_fee_stroops)?;
-        Self::increment_contact_count(&env, &scout);
 
         let record = ContactRecord {
             player_id,
@@ -1197,8 +1186,10 @@ impl ScoutAccessContract {
             return Ok(0);
         }
 
-        // Check quota with the count we're about to add
-        Self::check_pro_contact_quota_with_count(&env, &scout, new_contacts)?;
+        // Unified Pro-tier quota: check limit and increment atomically for
+        // the entire batch in one call. Uses the same renewal-aware logic as
+        // pay_to_contact (n=1) via the shared helper.
+        Self::check_and_reserve_pro_quota(&env, &scout, new_contacts)?;
 
         // Single token transfer for all new contacts combined.
         let total_fee = safe_mul_i128(config.contact_fee_stroops, new_contacts as i128)
@@ -3516,9 +3507,9 @@ mod tests {
         client.pay_to_contact(&scout, &2u64);
         client.pay_to_contact(&scout, &3u64);
 
-        // Fourth contact must be rejected with ProContactLimitReached (#19).
+        // Fourth contact must be rejected with ContactQuotaExceeded (#1161 unification).
         let res = client.try_pay_to_contact(&scout, &4u64);
-        assert_eq!(res, Err(Ok(ScoutAccessError::ProContactLimitReached)));
+        assert_eq!(res, Err(Ok(ScoutAccessError::ContactQuotaExceeded)));
     }
 
     #[test]
@@ -3597,7 +3588,7 @@ mod tests {
         client.pay_to_contact(&scout, &4u64);
         assert_eq!(
             client.try_pay_to_contact(&scout, &5u64),
-            Err(Ok(ScoutAccessError::ProContactLimitReached))
+            Err(Ok(ScoutAccessError::ContactQuotaExceeded))
         );
     }
 
