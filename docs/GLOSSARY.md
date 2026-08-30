@@ -251,7 +251,7 @@ only) log trial offers that advance a player to Level 3.
 
 - Relevant functions: `register_scout`, `subscribe`, `pay_to_contact`,
   `log_trial_offer` — see
-  [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md#registration).
+  [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md#scout_access).
 
 ---
 
