@@ -542,26 +542,18 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Contract test coverage:
+Rather than maintaining a hand-curated checklist here, refer directly to the test suites in each contract's source tree. Each directory contains the full, up-to-date coverage picture:
 
-- ✅ Player registration, duplicate prevention, profile updates
-- ✅ Scout registration
-- ✅ Validator registration, revocation, and active state checks
-- ✅ Milestone approval — happy path, multiple milestones per player
-- ✅ Revoked validator cannot approve milestones
-- ✅ Unregistered validator cannot approve milestones
-- ✅ Progress level sequence (Unverified → VerifiedIdentity → PerformanceMilestones → EliteTier)
-- ✅ Cannot exceed EliteTier
-- ✅ Progress history entries recorded per level change
-- ✅ Scout subscription — Basic, Pro, Elite tiers with XLM fee settlement
-- ✅ Pay-to-contact with active subscription
-- ✅ Duplicate contact prevention
-- ✅ Contact without subscription fails
-- ✅ Subscription expiry enforcement
-- ✅ Trial offer logging (Elite only)
-- ✅ Trial offer rejected for non-Elite tier
-- ✅ Fee accumulation and admin withdrawal
-- ✅ Pause / unpause circuit breaker
+| Directory | What it covers |
+|-----------|----------------|
+| `contracts/registration/src/lib.rs` (inline tests) | Player registration, scout registration, duplicate prevention, profile updates, admin initialization, field-validation guards |
+| `contracts/verification/src/lib.rs` (inline tests) | Validator registry CRUD, milestone approval happy path, revoked/unregistered validator guards, evidence-hash storage, validator-cap enforcement |
+| `contracts/progress/src/lib.rs` (inline tests) | Four-tier level state machine (Unverified → VerifiedIdentity → PerformanceMilestones → EliteTier), invalid-transition rejection, progress history recording, dispute-resolution level reset |
+| `contracts/scout_access/src/lib.rs` (inline tests) | Scout subscriptions (Basic / Pro / Elite) with XLM fee settlement, pay-to-contact flow, duplicate-contact prevention, subscription-expiry enforcement, trial offer logging (Elite only), trial offer rejection for non-Elite, fee accumulation and admin withdrawal, pause / unpause circuit breaker, subscription downgrade guard, auto-renewal logic |
+| `contracts/scout_access/tests/` | Integration tests for the full trial-offer flow across contract boundaries |
+| `tests/` | Cross-contract event emission tests |
+
+> **Note:** The workspace has known compile-blockers tracked in the "get the workspace green" umbrella issue. Test items that depend on features not yet merged should be treated as **not currently running** until that issue is resolved. Do not rely on this README as a statement of passing coverage — run `cargo test --workspace` and inspect the output directly.
 
 ## MVP Scope
 
