@@ -238,6 +238,14 @@ pub fn reset_player_level(
 pub fn get_level(env: Env, player_id: u64) -> ProgressLevel
 pub fn get_history_count(env: Env, player_id: u64) -> u32
 pub fn get_progress_history(env: Env, player_id: u64) -> Vec<ProgressEntry>
+pub fn get_progress_history_page(env: Env, player_id: u64, offset: u32, limit: u32) -> Vec<ProgressEntry>
+pub fn get_history_page_with_cursor(
+    env: Env,
+    player_id: u64,
+    cursor_snapshot: Option<u32>,
+    cursor_next_index: Option<u32>,
+    limit: u32,
+) -> (Vec<ProgressEntry>, u32, u32)
 pub fn get_history_since(env: Env, player_id: u64, since_timestamp: u64) -> Vec<ProgressEntry>
 pub fn health(env: Env) -> ContractHealth
 pub fn version(env: Env) -> String
@@ -432,6 +440,10 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 12 | `ScoutNotFound` | Invalid `scout_id` |
 | 13 | `InvalidInput` | Field too long, bad hash count, or empty value |
 | 14 | `PendingAdminNotSet` | `accept_admin` called without a prior `propose_admin` |
+| 15 | `PlayerCapReached` | Player registration cap reached — a hard stop, not retryable |
+| 16 | `RegistrationCooldown` | Caller registered again before the cooldown elapsed — retryable |
+| 17 | `PlayerRecordEvicted` | `restore_player_record` targeted a fully evicted, unrecoverable player entry |
+| 18 | `ScoutRecordEvicted` | `restore_scout_record` targeted a fully evicted, unrecoverable scout entry |
 
 ### `VerificationError` (verification)
 

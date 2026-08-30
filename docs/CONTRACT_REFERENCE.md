@@ -724,7 +724,7 @@ registration is permitted; duplicate prevention is enforced per role only.
 | 11 | `Overflow` | Arithmetic overflow in fee calculation |
 | 12 | `ScoutNotFound` | Scout ID does not exist |
 | 13 | `InvalidInput` | One or more input parameters are invalid |
-| 14 | `ValidatorCapReached` | Maximum number of registered validators has been reached |
+| 14 | `PendingAdminNotSet` | `accept_admin` called without a pending `propose_admin` proposal |
 | 15 | `PlayerCapReached` | Maximum number of registered players has been reached |
 | 16 | `RegistrationCooldown` | Registration attempted before the cooldown period has elapsed |
 | 17 | `PlayerRecordEvicted` | Player record was evicted from contract storage |
