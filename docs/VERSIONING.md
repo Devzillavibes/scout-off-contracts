@@ -122,16 +122,19 @@ When adding new entries to the Version History table:
 - **Summary**: Provide a concise summary of changes, explicitly calling out breaking changes if `MAJOR`.
 - **Cross-reference**: Every entry must mirror the corresponding entry in [CHANGELOG.md](../CHANGELOG.md) — keep both files in sync.
 
-> **Current enforcement gap:** Keeping this Version History table current is
-> currently a convention-only process that relies on contributor discipline; no
-> CI check enforces that MAJOR or MINOR version changes add a corresponding row.
+> **Enforced by CI:** The `abi-diff` job fails any MAJOR/MINOR ABI change unless
+> it also adds a matching Version History row in this table alongside the
+> corresponding `CHANGELOG.md` entry.
 
 | Version | Date | Type | Summary |
 |---------|------|------|---------|
 | v0.1.0 (all) | 2025 | MINOR | Initial release — all four contracts with full test coverage |
 | v0.2.0 (scout_access) | 2026-07-28 | MAJOR | BREAKING: `ContactQuotaExceeded` (18) deprecated; `batch_contact_players` now returns `ProContactLimitReached` (20) for Pro-tier quota exceeded; error code 18 slot reserved |
 | v0.2.0 (verification) | 2026-07-29 | MINOR | Added `attest_milestone` k-of-n threshold consensus for milestone approval (new fns, 3 error codes appended: 26-28, retroactive vote invalidation on validator revocation); `approve_milestone` unchanged by default (`threshold = 1`) |
+| v0.3.0 (scout_access) | 2026-08-18 | MINOR | Added escrow-backed trial offers: `log_trial_offer` now charges `trial_offer_escrow_stroops`, `expire_trial_offers(limit)` sweeps stale entries after `trial_offer_expiry_secs`, and `admin_refund_trial_escrow` provides a targeted recovery path for individual stuck escrows. |
 | v0.3.0 (all) | 2026-08-18 | MINOR | Completed cross-contract wiring observability rollout (issue #1041): `get_wiring_state()` on all four contracts, per-link re-wiring epoch + `wiring_updated` event on every setter, verification's legacy first-call-only guards preserved unchanged. All new storage keys additive — see CHANGELOG.md for the full summary |
+| v0.3.1 (scout_access) | 2026-08-18 | MINOR | Implemented `EvidenceAccessGrant` confidential-evidence access tracking: `pay_to_contact` and `batch_contact_players` record a grant, `has_evidence_access` / `get_evidence_access_grant` / `get_player_access_grants` expose it, and `admin_revoke_evidence_access` makes a grant non-active without deleting the historical record. |
+| v0.4.0 (verification) | 2026-08-19 | MAJOR | BREAKING: Added dispute-jury escalation for high-impact milestone disputes. `MilestoneDispute` grows with `impact_score`, `jury_required`, `quorum`, `votes_for`, `votes_against`, and `voting_deadline`; `set_jury_config`, `cast_dispute_vote`, and `tally_dispute` add the full jury flow, while low-impact disputes remain admin-resolved. Requires migration for existing stored disputes. |
 | v1.0.0 (verification) | 2026-08-19 | MAJOR | BREAKING: `revoke_validator` and `batch_revoke_validators` parameter lists changed — explicit `RevocationSeverity` enum replaces magic-string severity inference. Added for-cause cascade sweep (`run_cascade_sweep`, `continue_revocation_cascade`), `is_milestone_flagged`, `rereview_milestone`, `get_revocation_record`. New error codes 32 (`NotEligibleToReReview`) and 33 (`MilestoneNotFlagged`). New events: `milestone_flagged`, `milestone_flag_cleared`, `revocation_cascade_complete`, `revocation_cascade_continued`. See CHANGELOG.md and docs/VALIDATOR_REVOCATION_REREVIEW.md for full details. |
 | v1.1.0 (all) | 2026-08-20 | MINOR | Added unauthenticated scalar peer-address getters for the six links identified by issue #1116; each returns `None` until configured and leaves the aggregate wiring-state APIs unchanged. |
 <!-- Template / Example for future entries: -->
