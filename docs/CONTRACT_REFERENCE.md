@@ -4841,20 +4841,31 @@ pub struct TrialOffer {
 | 16 | `DuplicateEvidence` | Evidence hash has already been used in a prior `approve_milestone` call |
 | 17 | `MilestoneLimitExceeded` | Validator has already approved 5 milestones for this player |
 | 18 | `DisputeAlreadyResolved` | Dispute was already resolved and cannot be resolved again |
-| 19 | `PendingAdminNotSet` | `accept_admin` called without a pending proposal |
-| 20 | `ApproveMilestonePaused` | `approve_milestone` function is independently paused |
-| 21 | `InvalidAttestation` | The provided attestation signature is invalid or does not match the expected issuer |
-| 22 | `UntrustedIssuer` | The attestation issuer is not registered in the trusted issuer registry |
-| 23 | `CredentialExpired` | The credential claim has expired |
-| 24 | `IssuerCapReached` | The issuer registry limit (20) has been reached; contract upgrade required to raise the cap |
-| 25 | `IssuerAlreadyRegistered` | The issuer is already registered |
-| 26 | `IssuerNotFound` | The issuer was not found in the registry |
+| 19 | `PendingAdminNotSet` | `accept_admin` called before an admin transfer was proposed |
 | 20 | `ApproveMilestonePaused` | `approve_milestone` is paused independently of the whole-contract pause |
-| 21 | `SpecializationMismatch` | `milestone_category` supplied to `approve_milestone` but validator is not tagged for that category |
-| 26 | `DuplicateAttestation` | Same active validator attested to the same claim within its current voting round |
-| 27 | `TooManyPendingVotes` | Validator already has `MAX_PENDING_VOTES_PER_VALIDATOR` (25) concurrent open votes |
-| 28 | `ThresholdModeRequiresAttestation` | `approve_milestone` called while `get_milestone_threshold() > 1` — use `attest_milestone` |
-| 29 | `RegistrationCallFailed` | Cross-contract call to registration contract failed when verifying dispute-milestone wallet-to-player-id binding |
+| 21 | `SpecializationMismatch` | `milestone_category` supplied to `approve_milestone` but the validator is not tagged for that category |
+| 22 | `InvalidAttestation` | ed25519 signature over the attestation payload failed, or its contract/network binding does not match this instance |
+| 23 | `AttestationKeyNotFound` | No attestation public key has been registered for this validator |
+| 24 | `InvalidNonce` | Attestation nonce is not strictly greater than the last accepted nonce |
+| 25 | `RegistrationCooldown` | Validator registration attempted before the cooldown window elapsed |
+| 26 | `DuplicateAttestation` | Same active validator attested to the same `(player_id, evidence_hash)` claim within its current voting round |
+| 27 | `TooManyPendingVotes` | Validator already has `MAX_PENDING_VOTES_PER_VALIDATOR` concurrent open attestation votes |
+| 28 | `ThresholdModeRequiresAttestation` | `approve_milestone` / `submit_attested_milestone` called while `get_milestone_threshold() > 1` — use `attest_milestone` |
+| 29 | `RegistrationCallFailed` | Cross-contract call to the registration contract failed |
+| 30 | `MigrationNotActive` | Migration window is not currently active; call `open_migration_window` first |
+| 31 | `MilestoneAlreadyExists` | A `Milestone` already exists at `(player_id, milestone_index)` with different content |
+| 32 | `DisputeAlreadyExists` | A `MilestoneDispute` already exists at `(player_id, milestone_index)` with different content |
+| 33 | `ValidatorRecordEvicted` | `restore_validator_record` targeted a validator entry whose archival grace period has fully elapsed |
+| 34 | `MilestoneRecordEvicted` | `restore_milestone_record` targeted a milestone entry that has been fully evicted |
+| 35 | `NotEligibleToReReview` | `rereview_milestone` called by a wallet that is not a currently-active validator |
+| 36 | `MilestoneNotFlagged` | `rereview_milestone` called on a milestone not currently flagged as pending re-review |
+| 37 | `DisputeRequiresJury` | `resolve_dispute` called on a dispute that requires jury resolution — use `tally_dispute` |
+| 38 | `NotJuryDispute` | `cast_dispute_vote` / `tally_dispute` called on a dispute not routed to the jury path |
+| 39 | `VotingWindowClosed` | `cast_dispute_vote` called after the voting window has closed |
+| 40 | `ConflictOfInterest` | `cast_dispute_vote` called by the validator who approved the disputed milestone |
+| 41 | `AlreadyVoted` | `cast_dispute_vote` called by a validator who has already voted on this dispute |
+| 42 | `VotingWindowOpen` | `tally_dispute` called before the window closes with votes tied at or above quorum |
+| 43 | `QuorumNotReached` | `tally_dispute` called before the window closes and quorum not yet reached |
 
 ### `ProgressError` (progress contract)
 
@@ -4941,8 +4952,6 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `validator_revoked` | event_name, admin (Address) | wallet (Address), reason (String) | Validator deactivated |
 | `validator_restored` | event_name, admin (Address) | wallet (Address) | Revoked validator re-activated |
 | `validator_transferred` | event_name, admin (Address) | old_wallet (Address), new_wallet (Address) | Validator identity migrated to new wallet |
-| `issuer_registered` | event_name, issuer_wallet (Address) | issuer_name (String) | New trusted credential issuer onboarded |
-| `issuer_revoked` | event_name, issuer_wallet (Address) | issuer_wallet (Address) | Trusted credential issuer deactivated |
 | `milestone_disputed` | event_name, player_wallet (Address) | player_id (u64), milestone_index (u32), reason (String) | Player disputes a milestone attribution |
 | `dispute_resolved` | event_name, admin (Address) | player_id (u64), milestone_index (u32), upheld (bool) | Admin resolves a milestone dispute |
 | `progress_contract_updated` | event_name, admin (Address) | progress_contract (Address) | Progress contract address re-wired |
