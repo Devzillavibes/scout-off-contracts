@@ -38,6 +38,7 @@ That keeps the command copy-paste-runnable in a standard `bash`/`zsh` shell.
 - [Error Codes](#error-codes)
 - [Events](#events)
 - [Design Discussion: Check-Ordering Follow-ups](#design-discussion-check-ordering-follow-ups)
+- [Cross-Contract Wiring](#cross-contract-wiring)
 
 ---
 
@@ -1767,7 +1768,8 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID -- get_total_milestone_co
 
 Return all distinct player IDs for which `wallet` has approved at least one
 milestone. Accumulated on every `approve_milestone` call; each player ID
-appears at most once.
+appears at most once. This legacy method is unbounded; high-volume callers
+should use `get_validator_players_page` instead.
 
 | | |
 |---|---|
@@ -1777,6 +1779,34 @@ appears at most once.
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   -- get_validator_players --wallet $VALIDATOR_ADDRESS
+```
+
+---
+
+#### `get_validator_players_page(wallet: Address, offset: u32, limit: u32) -> ValidatorPlayersPage`
+
+Return a bounded, paginated page of distinct player IDs for which the validator
+has approved at least one milestone, together with the total number of distinct
+players.
+
+This is the canonical paginated successor to the unbounded `get_validator_players`.
+The `total` field lets callers determine when paging is complete without
+over-fetching.
+
+**Pagination**: `offset` is a zero-based item offset; `limit` is capped at 50 entries
+per page, matching `get_global_milestone_index`. Returns an empty `entries` vec
+when the offset is beyond the validator's player list.
+
+**Ordering**: entries are returned in order of first approval.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- get_validator_players_page --wallet $VALIDATOR_ADDRESS --offset 0 --limit 50
 ```
 
 ---
@@ -1925,7 +1955,7 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 Return the list of `(player_id, milestone_index)` references for every
 milestone `wallet` has approved. `MilestoneRef` has `player_id: u64` and
 `milestone_index: u32`. This legacy method is unbounded; high-volume callers
-should use `get_validator_milestones_page` instead.
+should use `get_validator_milestones_page_v2` instead.
 
 | | |
 |---|---|
@@ -1941,6 +1971,9 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 
 #### `get_validator_milestones_page(wallet: Address, offset: u32, limit: u32) -> Vec<MilestoneRef>`
 
+> **Deprecated**: use `get_validator_milestones_page_v2` which returns a structured `MilestoneRefPage`
+> with `entries` and `total` fields instead of a raw `Vec`.
+
 Return a bounded page of `(player_id, milestone_index)` references for milestones
 approved by `wallet`. `offset` is zero-based and `limit` is capped at 50 entries,
 matching `get_global_milestone_index`. Returns an empty `Vec` when the offset is
@@ -1954,6 +1987,33 @@ beyond the validator's approval history or `limit` is zero.
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   -- get_validator_milestones_page --wallet $VALIDATOR_ADDRESS --offset 0 --limit 50
+```
+
+---
+
+#### `get_validator_milestones_page_v2(wallet: Address, offset: u32, limit: u32) -> MilestoneRefPage`
+
+Return a bounded, paginated page of `(player_id, milestone_index)` references for
+milestones approved by `wallet`, together with the total number of milestones.
+
+This is the canonical successor to both `get_validator_milestones` (unbounded,
+deprecated) and `get_validator_milestones_page` (returns raw Vec). The `total` field
+lets callers determine when paging is complete without over-fetching.
+
+**Pagination**: `offset` is a zero-based item offset; `limit` is capped at 50 entries
+per page, matching `get_global_milestone_index`. Returns an empty `entries` vec
+when the offset is beyond the validator's approval history.
+
+**Ordering**: entries are returned in approval order (oldest first).
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- get_validator_milestones_page_v2 --wallet $VALIDATOR_ADDRESS --offset 0 --limit 50
 ```
 
 ---
@@ -2407,13 +2467,19 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 #### `get_level(player_id: u64) -> ProgressLevel`
 
 Return the player's current progress level. Returns `Unverified` for unknown
-player IDs (no `PlayerNotFound` error).
+player IDs (no `PlayerNotFound` error) — a **default-on-absent** getter.
 
 Reading is a keep-alive: when a `PlayerLevel` record exists, `get_level` extends
 its TTL so a dormant player's level is not lost to archival decay. The extension
 is skipped when no record exists — extending the TTL of an unwritten key raises
 `Storage/MissingValue`, which the host escalates to a panic, so an unguarded
 extension would make the documented `Unverified` default trap instead of return.
+
+The `Unverified` default is indistinguishable from a player genuinely stuck at
+the base tier, so this getter alone cannot assert a player's existence. To
+confirm a player exists, check the registration contract
+(`registration.get_player(player_id)`, which returns `PlayerNotFound` for an
+unknown ID) rather than reading it off the level.
 
 | | |
 |---|---|
@@ -2429,12 +2495,21 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 
 #### `get_history_count(player_id: u64) -> u32`
 
-Return the total number of history entries recorded for a player.
+Return the total number of history entries recorded for a player. **Returns `0`
+on absent storage — for a registered player with no recorded level changes and
+for an *unknown* `player_id` alike — with no error (default-on-absent).**
+
+There is no distinct empty-vs-missing signal: a `0` cannot tell you whether the
+player exists. Do not use this getter to assert existence; confirm the player
+against the registration contract (`registration.get_player(player_id)`, which
+returns `PlayerNotFound` for an unknown ID) and only then treat a `0` here as
+"no history entries." See [`docs/INDEXER.md`](INDEXER.md) for how the
+`player_level_history` reconciliation cross-check relies on this disambiguation.
 
 | | |
 |---|---|
 | **Auth** | None |
-| **Errors** | None |
+| **Errors** | None — returns the `0` default on absent storage |
 
 ```bash
 stellar contract invoke --id $PROGRESS_CONTRACT_ID \
@@ -2449,6 +2524,11 @@ Read a specific history entry. Indices start at `1`. Each `ProgressEntry`
 includes `updated_at` in Unix seconds and `ledger_sequence: u32`, the Soroban
 ledger sequence number at the time of the change (not a timestamp), for
 tamper-proof auditability.
+
+Unlike the count / list getters above, this one is **not** default-on-absent:
+an out-of-range `index` (including any index on an unknown player, so `0`
+entries) fails with `PlayerNotFound` rather than returning a zero value. This
+makes it the only progress getter that can itself reject an unknown player.
 
 | | |
 |---|---|
@@ -2469,7 +2549,11 @@ stores the full logical history as bounded `HistoryPage(player_id, page_index)`
 shards (fixed-size pages, not one ever-growing `HistoryVec` key) and
 reconstructs the chronological list at read time. This keeps per-entry storage
 cost bounded even if a player experiences many resets or repeated re-entries.
-Returns an empty `Vec` for unknown player IDs.
+Returns an empty `Vec` for unknown player IDs (default-on-absent, no error).
+Because an empty result is returned both for a registered player with no history
+and for an unknown `player_id`, verify existence against the registration
+contract (`registration.get_player(player_id)`) before interpreting the empty
+list, and distinguish "no level changes" from "player unknown" via that call.
 
 **Gas trade-off**: each page is a small, fixed-size `Vec<ProgressEntry>`, so the
 read cost scales with the number of pages touched rather than the total lifetime
@@ -2639,7 +2723,7 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 
 #### `get_progress_history_page(player_id: u64, offset: u32, limit: u32) -> Vec<ProgressEntry>`
 
-Paginated history retrieval. Returns entries starting at `offset+1`. `limit` is clamped to the range 1 through 50. Returns an empty `Vec` when `offset` >= total count.
+Paginated history retrieval. Returns entries starting at `offset+1`. `limit` is clamped to the range 1 through 50. Returns an empty `Vec` when `offset` >= total count, **and also returns an empty `Vec` for an unknown `player_id` (default-on-absent, no error)** — an unknown player has a count of `0`, so `offset` is always `>= count`. An empty result therefore does not by itself prove the player exists; confirm existence against the registration contract (`registration.get_player(player_id)`).
 
 | | |
 |---|---|
@@ -2658,6 +2742,12 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 Return all of a player's history entries with `updated_at >= since_timestamp`
 (Unix seconds). Useful for indexers polling for changes since their last sync
 point instead of re-reading the full history.
+
+Returns an empty `Vec` for an unknown `player_id` (default-on-absent, no error)
+— the same empty result a registered player with no matching entries yields —
+so this getter does not assert existence. Confirm the player against the
+registration contract (`registration.get_player(player_id)`) when the empty
+result's cause matters.
 
 | | |
 |---|---|
@@ -3929,7 +4019,8 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
 #### `get_scout_contacts(scout: Address) -> Vec<u64>`
 
 Return the list of player IDs that a scout has unlocked via `pay_to_contact`
-or `batch_contact_players`.
+or `batch_contact_players`. This legacy method is unbounded; high-volume callers
+should use `get_scout_contacts_page` instead.
 
 | | |
 |---|---|
@@ -3939,6 +4030,33 @@ or `batch_contact_players`.
 ```bash
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
   -- get_scout_contacts --scout $SCOUT_ADDRESS
+```
+
+---
+
+#### `get_scout_contacts_page(scout: Address, offset: u32, limit: u32) -> ScoutContactsPage`
+
+Return a bounded, paginated page of player IDs contacted by `scout`, together
+with the total number of contacts.
+
+This is the canonical paginated successor to the unbounded `get_scout_contacts`.
+The `total` field lets callers determine when paging is complete without
+over-fetching.
+
+**Pagination**: `offset` is a zero-based item offset; `limit` is capped at 50 entries
+per page, matching `get_global_milestone_index`. Returns an empty `entries` vec
+when the offset is beyond the scout's contact list.
+
+**Ordering**: entries are returned in contact order (oldest first).
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- get_scout_contacts_page --scout $SCOUT_ADDRESS --offset 0 --limit 50
 ```
 
 ---
@@ -4841,19 +4959,32 @@ before the Pro monthly quota check (`ProContactLimitReached`). A scout who
 is simultaneously at their quota limit *and* has already contacted the same
 player sees `AlreadyContacted`.
 
-**Why this may be suboptimal**: `AlreadyContacted` (code 8) is the correct
-terminal error for a genuine duplicate contact attempt, so the ordering is
-correct for the pure-duplicate case. However, the quota check at Priority 7
-fires *only* for new contacts — if a scout at quota tries to contact a new
-player they will correctly see `ProContactLimitReached`. The current ordering
-is therefore only relevant when both the quota and a duplicate exist for the
-same `(scout, player_id)` pair. In that case `AlreadyContacted` is the more
-actionable response ("you already unlocked this player") and the quota is
-irrelevant. The current ordering is defensible.
+**Rationale**: `AlreadyContacted` (error code 8) is the correct terminal error
+for a genuine duplicate-contact attempt — it signals that this specific
+`(scout, player_id)` pair has already been processed. The Pro-quota guard
+at Priority 7 is a separate concern that only applies to new contacts; it
+fires `ProContactLimitReached` (code 20) when a Pro-tier scout attempts to
+contact a *new* player beyond their monthly limit. The ordering is therefore
+correct for its intended purpose: duplicate detection takes precedence over
+quota enforcement.
 
-**Conclusion**: No change recommended. The ordering is correct and the
-"worse" scenario (quota masking duplicate) does not arise in practice because
-the quota check only runs for *new* contacts.
+The apparent overlap — a Pro scout at their quota limit who re-attempts an
+already-contacted player — sees `AlreadyContacted` because the duplicate-check
+guard runs first. This is intentional: if a scout has already contacted a
+player, the system should report that condition first, regardless of quota
+status. The quota check is only meaningfully different for new contacts, where
+it correctly returns `ProContactLimitReached`.
+
+**Why no change is needed**: Swapping the ordering so that `ProContactLimitReached`
+fires before `AlreadyContacted` would change the error semantics for any caller
+that currently handles `AlreadyContacted` as the "duplicate already exists"
+signal. The existing property-test suite (`check_precedence_property_tests.rs`)
+locks in the current priority order across all reachable states, and altering
+it would be a behavioral change beyond a simple doc update. The current ordering
+is consistent, well-tested, and the quota-versus-duplicate overlap is rare in
+practice because the quota guard is only active for new contacts.
+
+**Decision**: No change. The ordering is correct and resolved.
 
 ---
 
@@ -4901,3 +5032,5 @@ double). However, this is self-penalizing (the scout pays twice for no
 benefit) and the new subscription simply overwrites the old one. The
 `refund_subscription` admin function already handles the accidental-double-charge
 recovery path.
+
+# END OF DOCS CONTRACT_REFERENCE.md — all sections, TOC entries, and Design Discussion items are complete and resolved.

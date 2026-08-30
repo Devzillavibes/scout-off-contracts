@@ -121,7 +121,7 @@ Progress levels are configured per player and enforced on-chain by authorized va
 ### Validator Functions
 
 - `approve_milestone(player_id, milestone, evidence_hash)` — Confirm a player achievement and trigger progress update (validator auth required)
-- `register_validator(wallet, credentials)` — Onboard a new coach, academy, or trainer as an authorized validator (admin auth required)
+- `register_validator(wallet, credentials, affiliation, specializations)` — Onboard a new coach, academy, or trainer as an authorized validator (admin auth required). `affiliation` is the canonical organization identifier used for diversity gating, while `specializations` is the optional list of category tags (for example `"physical-stats"` or `"identity-kyc"`) that gate milestone approval when `milestone_category` is set.
 - `revoke_validator(wallet)` — Remove a validator from the trusted registry (admin auth required)
 
 ### Scout Functions
@@ -183,7 +183,7 @@ Each tier controls which player progress levels a scout can view and what action
 - "Academy confirms active membership" → Level 1 milestone, approved by KYC agent (`milestone_category: "identity-kyc"` — only validators tagged for identity-kyc)
 - "Trial offer received from FC Example" → Level 3 milestone, logged by scout via `log_trial_offer` and confirmed by the player via `confirm_trial_offer`
 
-Validators gain optional **specialization tags** (e.g. `"physical-stats"`, `"identity-kyc"`, `"match-performance"`) when registered. When `approve_milestone` is called with a `milestone_category`, the contract enforces that the validator holds a matching tag — preventing, for example, a pure identity-KYC agent from approving physical performance data. Untagged milestones (category omitted) remain open to any active validator, preserving backward compatibility.
+Validators are registered with an admin-set **affiliation** (canonical organization identifier, such as `"FC Example Academy"` or `"City Performance Lab"`) to gate diversity checks by distinct organizations. They also gain optional **specialization tags** (e.g. `"physical-stats"`, `"identity-kyc"`, `"match-performance"`) when registered. When `approve_milestone` is called with a `milestone_category`, the contract enforces that the validator holds a matching tag — preventing, for example, a pure identity-KYC agent from approving physical performance data. Untagged milestones (category omitted) remain open to any active validator, preserving backward compatibility.
 
 ## Player Lifecycle — Sequence Diagram
 
@@ -405,7 +405,9 @@ See `bindings/README.md` for usage details.
 
 ## Database Schema
 
-`migrations/001_initial_schema.sql` creates the fourteen PostgreSQL tables the backend event indexer needs:
+The `migrations/` directory contains the PostgreSQL migration files the backend event indexer needs. **Run every file in numeric order** — skipping any migration leaves tables, columns, or indexes missing and causes silent indexer errors at runtime.
+
+`migrations/001_initial_schema.sql` creates the fourteen base PostgreSQL tables:
 
 | Table | Purpose |
 |-------|---------|
@@ -424,13 +426,30 @@ See `bindings/README.md` for usage details.
 | `admin_transfers` | Audit trail of admin rotations across contracts |
 | `indexer_cursor` | Horizon event stream checkpoint (single row) |
 
-Run it against your backend PostgreSQL instance:
+Subsequent migrations add additional tables and columns:
+
+| Migration | What it adds |
+|-----------|-------------|
+| `002_cursor_upsert_helper.sql` | `advance_indexer_cursor()` helper function |
+| `003_diagnostic_events.sql` | `diagnostic_events` table |
+| `004_evidence_access_grants.sql` | `evidence_access_grants` table |
+| `004_scout_subscriptions_auto_renew.sql` | `auto_renew` column on `scout_subscriptions` |
+| `005_dispute_jury.sql` | Jury columns on `milestone_disputes`; `dispute_votes` table |
+| `005_milestone_flags.sql` | `milestone_flags` and `revocation_records` tables |
+
+Run all migrations against your backend PostgreSQL instance:
 
 ```bash
 psql $DATABASE_URL -f migrations/001_initial_schema.sql
+psql $DATABASE_URL -f migrations/002_cursor_upsert_helper.sql
+psql $DATABASE_URL -f migrations/003_diagnostic_events.sql
+psql $DATABASE_URL -f migrations/004_evidence_access_grants.sql
+psql $DATABASE_URL -f migrations/004_scout_subscriptions_auto_renew.sql
+psql $DATABASE_URL -f migrations/005_dispute_jury.sql
+psql $DATABASE_URL -f migrations/005_milestone_flags.sql
 ```
 
-The migration is idempotent and safe to re-run against an already-migrated database: every table and index uses `IF NOT EXISTS`, and the seed row uses `ON CONFLICT DO NOTHING`.
+All migrations are idempotent and safe to re-run against an already-migrated database. See `migrations/README.md` for apply-order notes and details on files that share a numeric prefix.
 
 To verify this database's copy of on-chain state hasn't drifted from the
 contracts, see [`scripts/reconcile-indexer.js`](scripts/reconcile-indexer.js)
@@ -572,7 +591,7 @@ Secondary features (fractionalized sponsorship, oracle integrations, advanced fi
 
 - `soroban-sdk = "25.3.1"` — Soroban smart contract SDK (all four contracts)
 - `stellar-cli` — Stellar CLI for deployment and contract invocation
-- `wasm32-unknown-unknown` — Rust compilation target for Soroban WASM output
+- `wasm32v1-none` — Rust compilation target for Soroban WASM output
 
 Frontend and backend dependencies live in their respective repos (`scoutchain-frontend`, `scoutchain-backend`).
 
