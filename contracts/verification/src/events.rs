@@ -211,10 +211,11 @@ pub fn dispute_resolved(
     );
 }
 
-/// Emitted when a milestone is recorded but level advancement is skipped because
-/// the player is already at the maximum level (EliteTier).  The milestone itself
-/// is still persisted; only the cross-contract advance_level call is omitted.
-/// `reason` is always "AlreadyAtMaxLevel".
+/// Emitted when a milestone is recorded but level advancement is skipped.
+/// The milestone itself is still persisted; only the cross-contract
+/// advance_level call is omitted. `reason` is either "AlreadyAtMaxLevel"
+/// (player already at EliteTier) or "DiversityGateNotMet" (the attesting set
+/// failed the affiliation-diversity or region-quorum requirement).
 pub fn level_advancement_skipped(env: &Env, player_id: u64, reason: &String) {
     env.events().publish(
         (Symbol::new(env, "level_advancement_skipped"), player_id),

@@ -2019,12 +2019,7 @@ mod tests {
         for player_id in [1u64, 2, 5, 7, 10, 20, 42, 55] {
             for _ in 0..2u32 {
                 let milestone_validator = Address::generate(&env);
-                ver_client.register_validator(
-                    &milestone_validator,
-                    &String::from_str(&env, "Test License"),
-                    &String::from_str(&env, "Test Academy"),
-                    &soroban_sdk::vec![&env],
-                );
+                ver_client.register_validator(&milestone_validator, &String::from_str(&env, "Test License"), &String::from_str(&env, "Test Academy"), &String::from_str(&env, "Default Region"), &soroban_sdk::vec![&env]);
                 for _ in 0..5 {
                     cid_seed += 1;
                     ver_client.approve_milestone(
@@ -2662,12 +2657,7 @@ mod tests {
         let ver_admin = Address::generate(&env);
         ver_client.initialize(&ver_admin);
         let milestone_validator = Address::generate(&env);
-        ver_client.register_validator(
-            &milestone_validator,
-            &String::from_str(&env, "Test License"),
-            &String::from_str(&env, "Test Academy"),
-            &soroban_sdk::vec![&env],
-        );
+        ver_client.register_validator(&milestone_validator, &String::from_str(&env, "Test License"), &String::from_str(&env, "Test Academy"), &String::from_str(&env, "Default Region"), &soroban_sdk::vec![&env]);
         let player_id = 1u64;
         ver_client.approve_milestone(
             &milestone_validator,
@@ -2886,12 +2876,7 @@ mod tests {
         prog_client.set_scout_access_contract(&scout_access);
 
         let validator = Address::generate(&env);
-        ver_client.register_validator(
-            &validator,
-            &soroban_sdk::String::from_str(&env, "UEFA-B-License"),
-            &soroban_sdk::String::from_str(&env, "Test Academy"),
-            &soroban_sdk::vec![&env],
-        );
+        ver_client.register_validator(&validator, &soroban_sdk::String::from_str(&env, "UEFA-B-License"), &soroban_sdk::String::from_str(&env, "Test Academy"), &String::from_str(&env, "Default Region"), &soroban_sdk::vec![&env]);
         // Approve one milestone for player 1 → milestone_ref 1 is valid.
         ver_client.approve_milestone(
             &validator,
