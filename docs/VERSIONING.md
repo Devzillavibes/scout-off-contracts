@@ -10,7 +10,7 @@ ScoutChain contracts follow [Semantic Versioning 2.0.0](https://semver.org/) —
 | **MINOR** | Backward-compatible addition — new function, new event, new error code appended at end of enum |
 | **PATCH** | Backward-compatible fix — bug fix, gas optimisation, documentation update in source |
 
-The current version of all four contracts is **v0.1.0**.
+The current version of all four contracts is **v1.1.0**.
 
 > **Note:** `Cargo.toml` `[workspace.package].version` is the build-time source of truth; keep the Version History table below in sync with every Cargo version bump.
 
@@ -126,6 +126,14 @@ When adding new entries to the Version History table:
 | Version | Date | Type | Summary |
 |---------|------|------|---------|
 | v0.1.0 (all) | 2025 | MINOR | Initial release — all four contracts with full test coverage |
+| v0.2.0 (scout_access) | 2026-07-28 | MAJOR | BREAKING: `ContactQuotaExceeded` (18) deprecated; `batch_contact_players` now returns `ProContactLimitReached` (20) for Pro-tier quota exceeded; error code 18 slot reserved |
+| v0.2.0 (verification) | 2026-07-29 | MINOR | Added `attest_milestone` k-of-n threshold consensus for milestone approval (new fns, 3 error codes appended: 26-28, retroactive vote invalidation on validator revocation); `approve_milestone` unchanged by default (`threshold = 1`) |
+| v0.3.0 (scout_access) | 2026-08-18 | MINOR | Added escrow-backed trial offers: `log_trial_offer` now charges `trial_offer_escrow_stroops`, `expire_trial_offers(limit)` sweeps stale entries after `trial_offer_expiry_secs`, and `admin_refund_trial_escrow` provides a targeted recovery path for individual stuck escrows (#1067). |
+| v0.3.0 (all) | 2026-08-18 | MINOR | Completed cross-contract wiring observability rollout (issue #1041): `get_wiring_state()` on all four contracts, per-link re-wiring epoch + `wiring_updated` event on every setter, verification's legacy first-call-only guards preserved unchanged. All new storage keys additive — see CHANGELOG.md for the full summary |
+| v0.3.1 (scout_access) | 2026-08-18 | MINOR | Implemented `EvidenceAccessGrant` confidential-evidence access tracking (#1040): `pay_to_contact` and `batch_contact_players` record a grant, `has_evidence_access` / `get_evidence_access_grant` / `get_player_access_grants` expose it, and `admin_revoke_evidence_access` makes a grant non-active without deleting the historical record. |
+| v0.4.0 (verification) | 2026-08-19 | MAJOR | BREAKING: Added dispute-jury escalation for high-impact milestone disputes (#1036). `MilestoneDispute` grows with `impact_score`, `jury_required`, `quorum`, `votes_for`, `votes_against`, and `voting_deadline`; `set_jury_config`, `cast_dispute_vote`, and `tally_dispute` add the full jury flow, while low-impact disputes remain admin-resolved. Requires migration for existing stored disputes. |
+| v1.0.0 (verification) | 2026-08-19 | MAJOR | BREAKING: `revoke_validator` and `batch_revoke_validators` parameter lists changed — explicit `RevocationSeverity` enum replaces magic-string severity inference. Added for-cause cascade sweep (`run_cascade_sweep`, `continue_revocation_cascade`), `is_milestone_flagged`, `rereview_milestone`, `get_revocation_record`. New error codes 32 (`NotEligibleToReReview`) and 33 (`MilestoneNotFlagged`). See CHANGELOG.md for full details. |
+| v1.1.0 (all) | 2026-08-20 | MINOR | Added unauthenticated scalar peer-address getters for the six links identified by issue #1116; each returns `None` until configured and leaves the aggregate wiring-state APIs unchanged. |
 <!-- Template / Example for future entries: -->
 <!-- | v0.2.0 (verification) | YYYY-MM-DD | MINOR | Added batch verification helper functions | -->
 <!-- | v1.0.0 (all) | YYYY-MM-DD | MAJOR | BREAKING: Updated storage key layout across all contracts | -->
