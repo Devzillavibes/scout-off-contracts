@@ -1925,10 +1925,11 @@ always reflects exactly the set of open disputes with no full-scan required at
 query time — making it possible to build an admin "disputes needing attention"
 dashboard from on-chain queries alone.
 
-- `limit` is capped at **50** per page, consistent with `get_global_milestone_index`
-  and `get_validator_milestones_page`.
+- `limit` is capped at **50** per page (minimum 1), consistent with
+  `get_global_milestone_index` and `get_validator_milestones_page`.
 - `offset` is a zero-based item offset (e.g. `offset=0, limit=50` → first page;
-  `offset=50, limit=50` → second page).
+  `offset=50, limit=50` → second page). If `offset >= total`, an empty list is
+  returned immediately without iterating the index.
 - Entries are returned **oldest-first** (insertion order).
 - The index tracks **only unresolved disputes** — resolved disputes are removed
   immediately, so the index stays naturally bounded in size.
@@ -1956,10 +1957,13 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 #### `get_global_milestone_index(offset: u32, limit: u32) -> GlobalMilestoneIndexPage`
 
 Return a page of the global milestone index — a rolling log of the most
-recent `(player_id, milestone_index)` pairs across all players and
-validators (capped at 500 entries; oldest entries are evicted first).
-`limit` is capped at 50 entries per page. `GlobalMilestoneIndexPage` has
-`entries: Vec<GlobalMilestoneEntry>` and `total: u32`.
+recent `(player_id, milestone_index)` pairs across all players and validators
+(capped at 500 entries; oldest entries are evicted first). `limit` is capped
+at 50 entries per page (minimum 1). `GlobalMilestoneIndexPage` has `entries:
+Vec<GlobalMilestoneEntry>` and `total: u32`.
+
+If `offset >= total`, `entries` is empty and `total` still reflects the full
+index length — safe to use for pagination bounds checks.
 
 | | |
 |---|---|
@@ -1969,6 +1973,34 @@ validators (capped at 500 entries; oldest entries are evicted first).
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   -- get_global_milestone_index --offset 0 --limit 50
+```
+
+---
+
+#### `get_milestones_since_page(player_id: u64, since_timestamp: u64, offset: u32, limit: u32) -> Vec<Milestone>`
+
+Return a bounded page of milestones for `player_id` that were approved at or
+after `since_timestamp` (Unix seconds). This is the bounded replacement for
+an unbounded time-range scan.
+
+**Pagination contract:**
+- `limit` is capped at **50** per page (minimum 1).
+- `offset` is bounded against the player's milestone count: if `offset >=
+  count`, an empty list is returned immediately without iterating.
+- Results are returned in approval order (oldest first within the page).
+- Callers who want all milestones without a time filter should use
+  `get_milestone_count` + `get_milestone` directly.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+# Milestones for player 1 approved after a given Unix timestamp
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- get_milestones_since_page --player_id 1 --since_timestamp 1700000000 \
+     --offset 0 --limit 50
 ```
 
 ---
