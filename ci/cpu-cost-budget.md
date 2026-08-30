@@ -31,8 +31,10 @@ measured-cost trends can be tracked across commits.
 | registration   | `filter_players`                 | 15,000,000                |
 | verification   | `register_validator`             | 15,000,000                |
 | verification   | `approve_milestone`              | 20,000,000                |
+| verification   | `attest_milestone`               | 25,000,000                |
+| verification   | `cast_dispute_vote`              | 20,000,000                |
+| verification   | `tally_dispute`                  | 30,000,000                |
 | verification   | `get_validator_milestones_page`  | 15,000,000                |
-| verification   | `revoke_validator(ForCause, limit=50, total=500)` | 50,000,000 |
 | progress       | `advance_level`                  | 15,000,000                |
 | progress       | `reset_player_level`             | 12,000,000                |
 | progress       | `get_progress_history_page`      | 10,000,000                |
@@ -40,6 +42,7 @@ measured-cost trends can be tracked across commits.
 | scout_access   | `subscribe`                      | 20,000,000                |
 | scout_access   | `pay_to_contact`                 | 20,000,000                |
 | scout_access   | `batch_contact_players` (5 ids)  | 25,000,000                |
+| scout_access   | `confirm_trial_offer`            | 22,000,000                |
 | scout_access   | `expire_trial_offers` (limit=20) | 25,000,000                |
 | scout_access   | `get_expiring_subscriptions` (20 scouts, buckets ~50k days from epoch, limit 50) | 1,500,000 |
 

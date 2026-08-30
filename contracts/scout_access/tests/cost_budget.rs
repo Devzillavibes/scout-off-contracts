@@ -37,6 +37,8 @@ const EXPIRE_TRIAL_OFFERS_CPU_BUDGET: u64 = 8_614_029;
 // seek avoids a full scan). Measured at a mid-history page (offset 500,
 // limit 50) — see cost_get_player_access_grants_at_1000_grants below.
 const GET_PLAYER_ACCESS_GRANTS_CPU_BUDGET: u64 = 15_000_000;
+// #1184: confirm_trial_offer includes cross-contract call to progress.advance_level
+const CONFIRM_TRIAL_OFFER_CPU_BUDGET: u64 = 22_000_000;
 
 fn default_fees() -> FeeConfig {
     FeeConfig {
@@ -211,4 +213,19 @@ fn cost_get_expiring_subscriptions() {
         "get_expiring_subscriptions(20 scouts, buckets ~50k days from epoch)",
         GET_EXPIRING_SUBSCRIPTIONS_CPU_BUDGET,
     );
+}
+
+#[test]
+fn cost_confirm_trial_offer() {
+    let (env, client, xlm) = setup();
+    let scout = Address::generate(&env);
+    let player = Address::generate(&env);
+    fund(&env, &xlm, &scout);
+    fund(&env, &xlm, &player);
+
+    // Create a trial offer
+    client.subscribe(&scout, &SubscriptionTier::Basic);
+    env.cost_estimate().budget().reset_default();
+    client.confirm_trial_offer(&scout, &player, &0u64);
+    assert_cpu_budget(&env, "confirm_trial_offer", CONFIRM_TRIAL_OFFER_CPU_BUDGET);
 }
