@@ -102,6 +102,7 @@ jobs:
           shellcheck scripts/check-trial-offer-flow-consistency.sh
           shellcheck scripts/check-error-code-continuity.sh
           shellcheck scripts/check-cargo-doc.sh
+          shellcheck scripts/check-migration-numbering.sh
       - name: Docs completeness check
         run: bash scripts/check-docs.sh
       - name: Event-topic consistency check
@@ -116,6 +117,8 @@ jobs:
         run: bash scripts/check-error-code-continuity.sh
       - name: Cargo doc missing-documentation check
         run: bash scripts/check-cargo-doc.sh
+      - name: Migration numbering check
+        run: bash scripts/check-migration-numbering.sh
       - name: Validate bindings package.json templates
         run: bash scripts/check-bindings.sh
 

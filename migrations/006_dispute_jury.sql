@@ -1,4 +1,4 @@
--- Migration 005: Dispute jury escalation system (issue #1036)
+-- Migration 006: Dispute jury escalation system (issue #1036)
 --
 -- Adds jury-related columns to milestone_disputes and a new dispute_votes
 -- table for per-validator audit trail.

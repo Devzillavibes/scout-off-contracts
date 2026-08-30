@@ -202,16 +202,11 @@ or indexes missing and will cause silent indexer errors at runtime.
 psql $DATABASE_URL -f migrations/001_initial_schema.sql
 psql $DATABASE_URL -f migrations/002_cursor_upsert_helper.sql
 psql $DATABASE_URL -f migrations/003_diagnostic_events.sql
-psql $DATABASE_URL -f migrations/004_evidence_access_grants.sql
 psql $DATABASE_URL -f migrations/004_scout_subscriptions_auto_renew.sql
-psql $DATABASE_URL -f migrations/005_dispute_jury.sql
-psql $DATABASE_URL -f migrations/005_milestone_flags.sql
+psql $DATABASE_URL -f migrations/005_evidence_access_grants.sql
+psql $DATABASE_URL -f migrations/006_dispute_jury.sql
+psql $DATABASE_URL -f migrations/007_milestone_flags.sql
 ```
-
-> **Note:** Where two files share the same numeric prefix (both `004_*` and both
-> `005_*`), apply them in alphabetical filename order — they are independent and
-> additive (different tables/columns) and have no inter-dependency within the same
-> prefix. See `migrations/README.md` for details.
 
 All migration files are idempotent (`CREATE TABLE IF NOT EXISTS`,
 `ALTER TABLE … ADD COLUMN IF NOT EXISTS`): re-running against an already-migrated
@@ -234,16 +229,16 @@ stored value, so replaying an old batch never accidentally rewinds the cursor.
 `003_diagnostic_events.sql` adds the `diagnostic_events` table for off-chain
 diagnostic event logging.
 
-`004_evidence_access_grants.sql` adds the `evidence_access_grants` table —
-the off-chain mirror of `scout_access.EvidenceAccessGrant`.
-
 `004_scout_subscriptions_auto_renew.sql` adds the `auto_renew` column to
 `scout_subscriptions` so the indexer can track per-scout auto-renewal opt-in.
 
-`005_dispute_jury.sql` adds jury-escalation columns to `milestone_disputes` and
+`005_evidence_access_grants.sql` adds the `evidence_access_grants` table —
+the off-chain mirror of `scout_access.EvidenceAccessGrant`.
+
+`006_dispute_jury.sql` adds jury-escalation columns to `milestone_disputes` and
 creates the `dispute_votes` table for per-validator audit trail.
 
-`005_milestone_flags.sql` adds the `milestone_flags` and `revocation_records`
+`007_milestone_flags.sql` adds the `milestone_flags` and `revocation_records`
 tables for the validator-revocation cascade re-review system.
 
 ### Resetting the Indexer Cursor

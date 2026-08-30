@@ -446,10 +446,10 @@ Subsequent migrations add additional tables and columns:
 |-----------|-------------|
 | `002_cursor_upsert_helper.sql` | `advance_indexer_cursor()` helper function |
 | `003_diagnostic_events.sql` | `diagnostic_events` table |
-| `004_evidence_access_grants.sql` | `evidence_access_grants` table |
 | `004_scout_subscriptions_auto_renew.sql` | `auto_renew` column on `scout_subscriptions` |
-| `005_dispute_jury.sql` | Jury columns on `milestone_disputes`; `dispute_votes` table |
-| `005_milestone_flags.sql` | `milestone_flags` and `revocation_records` tables |
+| `005_evidence_access_grants.sql` | `evidence_access_grants` table |
+| `006_dispute_jury.sql` | Jury columns on `milestone_disputes`; `dispute_votes` table |
+| `007_milestone_flags.sql` | `milestone_flags` and `revocation_records` tables |
 
 Run all migrations against your backend PostgreSQL instance:
 
@@ -457,13 +457,13 @@ Run all migrations against your backend PostgreSQL instance:
 psql $DATABASE_URL -f migrations/001_initial_schema.sql
 psql $DATABASE_URL -f migrations/002_cursor_upsert_helper.sql
 psql $DATABASE_URL -f migrations/003_diagnostic_events.sql
-psql $DATABASE_URL -f migrations/004_evidence_access_grants.sql
 psql $DATABASE_URL -f migrations/004_scout_subscriptions_auto_renew.sql
-psql $DATABASE_URL -f migrations/005_dispute_jury.sql
-psql $DATABASE_URL -f migrations/005_milestone_flags.sql
+psql $DATABASE_URL -f migrations/005_evidence_access_grants.sql
+psql $DATABASE_URL -f migrations/006_dispute_jury.sql
+psql $DATABASE_URL -f migrations/007_milestone_flags.sql
 ```
 
-All migrations are idempotent and safe to re-run against an already-migrated database. See `migrations/README.md` for apply-order notes and details on files that share a numeric prefix.
+All migrations are idempotent and safe to re-run against an already-migrated database. See `migrations/README.md` for apply-order notes and file reference.
 
 To verify this database's copy of on-chain state hasn't drifted from the
 contracts, see [`scripts/reconcile-indexer.js`](scripts/reconcile-indexer.js)

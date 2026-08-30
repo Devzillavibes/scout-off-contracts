@@ -1,4 +1,4 @@
--- Migration 005: milestone_flags — validator revocation cascade re-review (issue #1039)
+-- Migration 007: milestone_flags — validator revocation cascade re-review (issue #1039)
 --
 -- Adds two new tables:
 --   milestone_flags       — tracks which milestones are currently flagged as

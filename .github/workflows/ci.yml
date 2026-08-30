@@ -25,3 +25,5 @@ jobs:
             exit 1
           fi
           echo "No TODO/FIXME/HACK/XXX markers found."
+      - name: Check database migration numbering
+        run: bash scripts/check-migration-numbering.sh
