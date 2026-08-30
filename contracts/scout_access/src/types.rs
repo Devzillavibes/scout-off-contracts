@@ -178,4 +178,8 @@ pub enum DataKey {
     /// scout wallet → bool; true if the scout has opted in to auto-renewal.
     /// Set by `set_auto_renew`, consumed by `renew_if_due`.
     AutoRenew(Address),
+    /// Per-region override for the Pro-tier contact limit.
+    /// region (String) → u32 limit. When present, overrides `FeeConfig.pro_contact_limit`
+    /// for scouts whose registered region matches. Admin-managed only.
+    RegionalContactLimit(String),
 }

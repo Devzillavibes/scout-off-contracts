@@ -372,6 +372,71 @@ impl ScoutAccessContract {
         Ok(())
     }
 
+    /// Set (or update) a per-region Pro-tier contact-limit override.
+    ///
+    /// When a Pro scout in `region` calls `pay_to_contact` or
+    /// `batch_contact_players`, the quota check uses `limit` instead of the
+    /// platform-wide `FeeConfig.pro_contact_limit`. Passing a `limit` of 0 is
+    /// rejected with `InvalidInput` — use `remove_regional_contact_limit` to
+    /// delete an override entirely.
+    ///
+    /// Storage is bounded: each region name maps to a single `u32` value.
+    /// Admin-only so scouts cannot game their own quota.
+    pub fn set_regional_contact_limit(
+        env: Env,
+        region: String,
+        limit: u32,
+    ) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        if limit == 0 {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::RegionalContactLimit(region.clone()), &limit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RegionalContactLimit(region.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+        events::regional_contact_limit_set(&env, &admin, &region, limit);
+        Ok(())
+    }
+
+    /// Remove a previously-set per-region Pro-tier contact-limit override.
+    ///
+    /// After removal, scouts in that region fall back to the platform-wide
+    /// `FeeConfig.pro_contact_limit`. No-ops silently if no override existed.
+    /// Admin only.
+    pub fn remove_regional_contact_limit(
+        env: Env,
+        region: String,
+    ) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RegionalContactLimit(region));
+        Ok(())
+    }
+
+    /// Query the effective Pro-tier contact limit for a given region.
+    ///
+    /// Returns the regional override if one has been set for this region,
+    /// otherwise returns the platform-wide `FeeConfig.pro_contact_limit`.
+    pub fn get_regional_contact_limit(env: Env, region: String) -> u32 {
+        Self::bump_instance_ttl(&env);
+        if let Some(limit) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::RegionalContactLimit(region))
+        {
+            return limit;
+        }
+        Self::fee_config(&env).pro_contact_limit
+    }
+
     /// Emergency refund: admin returns `amount` XLM (stroops) from the
     /// contract balance to `scout`.  Use when a scout is accidentally
     /// double-charged (e.g. by the race condition this interval guard
@@ -725,6 +790,43 @@ impl ScoutAccessContract {
     // Pay-to-contact
     // -------------------------------------------------------------------------
 
+    /// Helper: resolve the effective Pro-tier contact limit for a scout.
+    ///
+    /// If the scout has a registered region (from the registration contract) and
+    /// a per-region override has been set for that region, return the override.
+    /// Otherwise fall back to the platform-wide `FeeConfig.pro_contact_limit`.
+    fn effective_pro_contact_limit(env: &Env, scout: &Address) -> u32 {
+        let config = Self::fee_config(env);
+        let platform_default = config.pro_contact_limit;
+
+        // Attempt to look up the scout's region from the registration contract.
+        let reg_contract_addr = match env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+        {
+            Some(addr) => addr,
+            None => return platform_default,
+        };
+
+        let reg_client = registration_contract::Client::new(env, &reg_contract_addr);
+        let scout_profile = match reg_client.try_get_scout_by_wallet(scout) {
+            Ok(profile) => profile,
+            Err(_) => return platform_default,
+        };
+
+        // Check for a regional override.
+        if let Some(limit) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::RegionalContactLimit(scout_profile.region))
+        {
+            return limit;
+        }
+
+        platform_default
+    }
+
     /// Helper: check Pro tier contact quota with a specific count (batch support).
     fn check_pro_contact_quota_with_count(
         env: &Env,
@@ -748,8 +850,7 @@ impl ScoutAccessContract {
         let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
         let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
 
-        let config = Self::fee_config(env);
-        let limit = config.pro_contact_limit;
+        let limit = Self::effective_pro_contact_limit(env, scout);
 
         if current.saturating_add(requested) > limit {
             return Err(ScoutAccessError::ContactQuotaExceeded);
@@ -836,7 +937,7 @@ impl ScoutAccessContract {
             } else {
                 0u32
             };
-            if current_count >= config.pro_contact_limit {
+            if current_count >= Self::effective_pro_contact_limit(&env, &scout) {
                 return Err(ScoutAccessError::ProContactLimitReached);
             }
             let new_period = ProContactPeriod {
