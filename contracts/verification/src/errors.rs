@@ -128,6 +128,28 @@ pub enum VerificationError {
     /// as pending re-review. The flag either never existed or was already
     /// cleared by a prior `rereview_milestone` call.
     MilestoneNotFlagged = 36,
+
+    // ── Jury escalation system (issue #1036) ──
+    /// `resolve_dispute` called on a dispute that requires jury resolution.
+    /// Use `tally_dispute` to finalize jury-required disputes.
+    DisputeRequiresJury = 37,
+    /// `cast_dispute_vote` or `tally_dispute` called on a dispute that was
+    /// not routed to the jury path (jury_required == false).
+    NotJuryDispute = 38,
+    /// `cast_dispute_vote` called after the voting window has closed.
+    VotingWindowClosed = 39,
+    /// `cast_dispute_vote` called by the validator who originally approved
+    /// the disputed milestone (conflict of interest).
+    ConflictOfInterest = 40,
+    /// `cast_dispute_vote` called by a validator who has already voted on
+    /// this specific dispute.
+    AlreadyVoted = 41,
+    /// `tally_dispute` called before the voting window closes and when the
+    /// vote count is tied at or above quorum (cannot resolve early on a tie).
+    VotingWindowOpen = 42,
+    /// `tally_dispute` called before the voting window closes and the
+    /// required quorum of votes has not yet been reached.
+    QuorumNotReached = 43,
 }
 
 impl AdminError for VerificationError {

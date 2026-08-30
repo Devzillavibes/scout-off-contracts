@@ -1768,7 +1768,8 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID -- get_total_milestone_co
 
 Return all distinct player IDs for which `wallet` has approved at least one
 milestone. Accumulated on every `approve_milestone` call; each player ID
-appears at most once.
+appears at most once. This legacy method is unbounded; high-volume callers
+should use `get_validator_players_page` instead.
 
 | | |
 |---|---|
@@ -1778,6 +1779,34 @@ appears at most once.
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   -- get_validator_players --wallet $VALIDATOR_ADDRESS
+```
+
+---
+
+#### `get_validator_players_page(wallet: Address, offset: u32, limit: u32) -> ValidatorPlayersPage`
+
+Return a bounded, paginated page of distinct player IDs for which the validator
+has approved at least one milestone, together with the total number of distinct
+players.
+
+This is the canonical paginated successor to the unbounded `get_validator_players`.
+The `total` field lets callers determine when paging is complete without
+over-fetching.
+
+**Pagination**: `offset` is a zero-based item offset; `limit` is capped at 50 entries
+per page, matching `get_global_milestone_index`. Returns an empty `entries` vec
+when the offset is beyond the validator's player list.
+
+**Ordering**: entries are returned in order of first approval.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- get_validator_players_page --wallet $VALIDATOR_ADDRESS --offset 0 --limit 50
 ```
 
 ---
@@ -1926,7 +1955,7 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 Return the list of `(player_id, milestone_index)` references for every
 milestone `wallet` has approved. `MilestoneRef` has `player_id: u64` and
 `milestone_index: u32`. This legacy method is unbounded; high-volume callers
-should use `get_validator_milestones_page` instead.
+should use `get_validator_milestones_page_v2` instead.
 
 | | |
 |---|---|
@@ -1942,6 +1971,9 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 
 #### `get_validator_milestones_page(wallet: Address, offset: u32, limit: u32) -> Vec<MilestoneRef>`
 
+> **Deprecated**: use `get_validator_milestones_page_v2` which returns a structured `MilestoneRefPage`
+> with `entries` and `total` fields instead of a raw `Vec`.
+
 Return a bounded page of `(player_id, milestone_index)` references for milestones
 approved by `wallet`. `offset` is zero-based and `limit` is capped at 50 entries,
 matching `get_global_milestone_index`. Returns an empty `Vec` when the offset is
@@ -1955,6 +1987,33 @@ beyond the validator's approval history or `limit` is zero.
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   -- get_validator_milestones_page --wallet $VALIDATOR_ADDRESS --offset 0 --limit 50
+```
+
+---
+
+#### `get_validator_milestones_page_v2(wallet: Address, offset: u32, limit: u32) -> MilestoneRefPage`
+
+Return a bounded, paginated page of `(player_id, milestone_index)` references for
+milestones approved by `wallet`, together with the total number of milestones.
+
+This is the canonical successor to both `get_validator_milestones` (unbounded,
+deprecated) and `get_validator_milestones_page` (returns raw Vec). The `total` field
+lets callers determine when paging is complete without over-fetching.
+
+**Pagination**: `offset` is a zero-based item offset; `limit` is capped at 50 entries
+per page, matching `get_global_milestone_index`. Returns an empty `entries` vec
+when the offset is beyond the validator's approval history.
+
+**Ordering**: entries are returned in approval order (oldest first).
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- get_validator_milestones_page_v2 --wallet $VALIDATOR_ADDRESS --offset 0 --limit 50
 ```
 
 ---
@@ -3930,7 +3989,8 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
 #### `get_scout_contacts(scout: Address) -> Vec<u64>`
 
 Return the list of player IDs that a scout has unlocked via `pay_to_contact`
-or `batch_contact_players`.
+or `batch_contact_players`. This legacy method is unbounded; high-volume callers
+should use `get_scout_contacts_page` instead.
 
 | | |
 |---|---|
@@ -3940,6 +4000,33 @@ or `batch_contact_players`.
 ```bash
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
   -- get_scout_contacts --scout $SCOUT_ADDRESS
+```
+
+---
+
+#### `get_scout_contacts_page(scout: Address, offset: u32, limit: u32) -> ScoutContactsPage`
+
+Return a bounded, paginated page of player IDs contacted by `scout`, together
+with the total number of contacts.
+
+This is the canonical paginated successor to the unbounded `get_scout_contacts`.
+The `total` field lets callers determine when paging is complete without
+over-fetching.
+
+**Pagination**: `offset` is a zero-based item offset; `limit` is capped at 50 entries
+per page, matching `get_global_milestone_index`. Returns an empty `entries` vec
+when the offset is beyond the scout's contact list.
+
+**Ordering**: entries are returned in contact order (oldest first).
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- get_scout_contacts_page --scout $SCOUT_ADDRESS --offset 0 --limit 50
 ```
 
 ---

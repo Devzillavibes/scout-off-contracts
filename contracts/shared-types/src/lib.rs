@@ -495,6 +495,36 @@ pub mod safe_math {
     }
 }
 
+// ── Shared pagination types ───────────────────────────────────────────────────
+//
+// All list-returning query functions that accept an `offset` + `limit` use one
+// of these page-result structs so callers receive both the requested window of
+// entries **and** the total count (which tells them when to stop paging).
+//
+// Soroban's `#[contracttype]` macro does not support Rust generics, so each
+// per-element type needs its own concrete Page struct.  The naming convention
+// is `<ElementType>Page`.  New structs should be added here rather than
+// reinvented per-contract.
+//
+// The `total` field reflects the size of the underlying collection at the
+// moment the function was called; it is not a ledger-snapshotted value.
+// Callers should treat it as an advisory guide for loop termination rather
+// than a guarantee of consistency across multiple calls.
+
+/// A page of `u64` IDs (e.g. player IDs) returned by a paginated query.
+///
+/// `entries` contains at most `limit` (capped at 50) items starting at
+/// `offset`.  `total` is the total number of items in the underlying
+/// collection at call time — use it to detect when paging is complete.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct U64Page {
+    /// The items in this page, in insertion order.
+    pub entries: soroban_sdk::Vec<u64>,
+    /// Total number of items in the underlying collection.
+    pub total: u32,
+}
+
 ///
 /// Rules:
 /// - CIDv0: starts with "Qm", exactly 46 characters, base58btc charset
