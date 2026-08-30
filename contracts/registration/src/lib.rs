@@ -1289,6 +1289,19 @@ impl RegistrationContract {
                         continue;
                     }
                     if let Ok(profile) = Self::load_player(&env, player_id) {
+                        // The composite index is only a performance hint, never a
+                        // trusted source. Re-validate the loaded profile against the
+                        // filter so a stale or corrupted bucket entry — from a
+                        // deregister_player leak, a set_player_level level/region
+                        // mismatch, or a restored-but-not-reindexed player — cannot
+                        // leak a non-matching player into the results. This mirrors
+                        // the level_gte re-check the slow path already performs.
+                        if !Self::level_gte(&profile.level, &min_level) {
+                            continue;
+                        }
+                        if profile.vitals.region != region {
+                            continue;
+                        }
                         if position_filter && profile.vitals.position != position {
                             continue;
                         }
@@ -3848,5 +3861,102 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    /// Regression for the fast-path index-trust bug (issue #1190): a stale or
+    /// corrupted `PlayersByLevelRegion` bucket entry must not leak into
+    /// `filter_players` results, and the fast (region) path must agree with the
+    /// slow (full-scan) path on which players actually match the filter.
+    #[test]
+    fn test_filter_players_fast_path_revalidates_corrupted_index() {
+        let (env, client) = setup();
+        env.host().set_invocation_resource_limits(None).unwrap();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let hashes: soroban_sdk::Vec<String> =
+            vec![&env, String::from_str(&env, "QmTest123")];
+        let west = String::from_str(&env, "West Africa");
+        let empty = String::from_str(&env, "");
+
+        // A genuinely Elite-tier player in West Africa — the only match.
+        let elite_wallet = Address::generate(&env);
+        let elite_id = client.register_player(&elite_wallet, &dummy_vitals(&env), &hashes);
+
+        // A player whose real level is Unverified but who is corruptly listed in
+        // the EliteTier/West Africa bucket (the set_player_level level-mismatch case).
+        let stale_wallet = Address::generate(&env);
+        let stale_id = client.register_player(&stale_wallet, &dummy_vitals(&env), &hashes);
+
+        // An Elite player registered in a different region, corruptly injected
+        // into the West Africa bucket (the region-mismatch case).
+        let europe_wallet = Address::generate(&env);
+        let europe_vitals = PlayerVitals {
+            age: 18,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "Europe"),
+            nationality: String::from_str(&env, "Spain"),
+        };
+        let europe_id = client.register_player(&europe_wallet, &europe_vitals, &hashes);
+
+        env.as_contract(&client.address, || {
+            // Pin resolved levels so both filter paths read deterministic data.
+            let p = env.storage().persistent();
+            p.set(&DataKey::PlayerLevel(elite_id), &ProgressLevel::EliteTier);
+            p.set(&DataKey::PlayerLevel(stale_id), &ProgressLevel::Unverified);
+            p.set(&DataKey::PlayerLevel(europe_id), &ProgressLevel::EliteTier);
+
+            // Corrupt the EliteTier/West Africa bucket to include all three ids,
+            // two of which do not actually match the (EliteTier, West Africa) key.
+            let key = DataKey::PlayersByLevelRegion(ProgressLevel::EliteTier, west.clone());
+            let mut ids: Vec<u64> = Vec::new(&env);
+            ids.push_back(elite_id);
+            ids.push_back(stale_id);
+            ids.push_back(europe_id);
+            p.set(&key, &ids);
+        });
+
+        // Fast path (region supplied): must return only the genuine match.
+        let fast = client.filter_players(
+            &west,
+            &empty,
+            &ProgressLevel::EliteTier,
+            &0u32,
+            &50u32,
+        );
+        assert_eq!(
+            fast.profiles.len(),
+            1,
+            "corrupted index entries must not leak into fast-path results"
+        );
+        assert_eq!(fast.profiles.get(0).unwrap().player_id, elite_id);
+
+        // Cost bound preserved: never more than the 50-result cap.
+        assert!(fast.profiles.len() <= 50);
+
+        // Slow path (no region): full scan re-checks level via resolve_level.
+        let slow = client.filter_players(
+            &empty,
+            &empty,
+            &ProgressLevel::EliteTier,
+            &0u32,
+            &50u32,
+        );
+
+        // Property: the fast-path result equals the slow-path result restricted
+        // to the queried region — the two paths agree on the matching set.
+        let mut slow_west: Vec<u64> = Vec::new(&env);
+        for profile in slow.profiles.iter() {
+            if profile.vitals.region == west {
+                slow_west.push_back(profile.player_id);
+            }
+        }
+        assert_eq!(slow_west.len(), fast.profiles.len());
+        assert_eq!(slow_west.get(0).unwrap(), fast.profiles.get(0).unwrap().player_id);
+
+        // The stale Unverified player is rejected by both paths' level check.
+        for profile in slow.profiles.iter() {
+            assert_ne!(profile.player_id, stale_id);
+        }
     }
 }
