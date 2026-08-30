@@ -61,6 +61,8 @@ jobs:
           shellcheck scripts/setup-testnet.sh
           shellcheck scripts/generate-bindings.sh
           shellcheck scripts/check-bindings.sh
+          shellcheck scripts/smoke-test.sh
+          shellcheck scripts/health-check.sh
           shellcheck testnet/seed.sh
       - name: Docs completeness check
         run: bash scripts/check-docs.sh
@@ -212,6 +214,13 @@ jobs:
               || { echo "ERROR: bindings/$pkg/dist/index.js not produced"; exit 1; }
             echo "  OK: dist/index.js present"
           done
+
+      - name: Run smoke tests (health assertions)
+        run: |
+          # shellcheck source=/dev/null
+          source .env.contracts
+          export DEPLOYER_SECRET
+          bash scripts/smoke-test.sh local
 
       - name: Stop local sandbox
         if: always()
