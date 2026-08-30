@@ -136,24 +136,30 @@ pub fn register_validator(
     env: Env,
     wallet: Address,
     credentials: String,
+    affiliation: String,
+    specializations: Vec<String>,
 ) -> Result<(), VerificationError>
 
-// reason is optional — pass None to omit a revocation reason
+// `affiliation` is the canonical org identifier used for diversity gating;
+// `specializations` are optional category tags such as "physical-stats" or "identity-kyc"
+// that must match the milestone category when nested category gating is active.
 pub fn revoke_validator(
     env: Env,
     wallet: Address,
+    severity: RevocationSeverity,
     reason: Option<String>,
 ) -> Result<(), VerificationError>
 
 pub fn batch_revoke_validators(
     env: Env,
     wallets: Vec<Address>,
+    severity: RevocationSeverity,
     reason: Option<String>,
 ) -> Result<(), VerificationError>
 
 pub fn batch_register_validators(
     env: Env,
-    entries: Vec<(Address, String)>,
+    entries: Vec<(Address, String, String, Vec<String>)>,
 ) -> Result<(), VerificationError>
 
 pub fn restore_validator(env: Env, wallet: Address) -> Result<(), VerificationError>
@@ -471,7 +477,7 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 20 | `ProContactLimitReached` | Pro-tier scout hit per-period contact limit |
 | 21 | `PendingAdminNotSet` | `accept_admin` called without a prior `propose_admin` |
 | 22 | `TrialOfferAlreadyConfirmed` | `confirm_trial_offer` called twice for same offer |
-| 23 | `TrialOfferExpired` | `confirm_trial_offer` called after offer expiry window |
+| 23 | `TrialOfferExpired` | Legacy compatibility code; expiry confirmation now commits the refund and returns success |
 
 > **Note:** Code 13 is intentionally reserved in `ScoutAccessError` and must not be assigned.
 
@@ -514,9 +520,21 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
    ```
 3. Retry the original transaction — because `ProgressCallFailed` aborts the whole transaction, there is no partial state to clean up.
 
+> **Retry only the original entry point, never `advance_level` directly (Issue #811 follow-up).**
+> `progress.advance_level` is **not** internally idempotent. It is a monotonic state-machine step: it reads the current level, computes `next()`, and appends a history entry. It does **not** key off `milestone_ref`, so calling it twice with the *same* `milestone_ref` advances two tiers and writes two history entries that are indistinguishable from a legitimate double advance.
+>
+> Retry is safe **only** because each production caller holds its own dedup key and the whole transaction reverts on failure:
+> - `verification.approve_milestone` → `DataKey::EvidenceUsed(evidence_hash)` (returns `DuplicateEvidence`, code 16)
+> - `scout_access.confirm_trial_offer` → `DataKey::ConfirmationNonce(...)` / absent `TrialEscrow` (returns `TrialOfferAlreadyConfirmed`, code 22)
+>
+> Because the failed attempt reverts, its dedup key is rolled back too, so the retry proceeds exactly once. An operator or new contract that calls `progress.advance_level` directly gets **no such protection** and must supply its own dedup key. Any new whitelisted caller of `advance_level` must do the same.
+>
+> Bounded blast radius: a replay can over-advance by at most three tiers; once at `EliteTier` further calls fail closed with `AlreadyAtMaxLevel` and write nothing. On the secondary (`scout_access`) path, a `milestone_ref` of `0` or one beyond the verification contract's real milestone count is rejected with `InvalidProgressTransition` (#457). Both are verified in `contracts/progress/tests/issue_811_idempotency.rs`.
+
 > **Tested guarantee (Issue #811):** This all-or-nothing claim is backed by adversarial tests, not just this prose explanation. See:
 > - `contracts/verification/tests/adversarial_atomicity.rs` — proves `approve_milestone` behavior on bad-wired progress contract and validates the `DuplicateEvidence` idempotency token as defense-in-depth.
 > - `contracts/scout_access/tests/adversarial_atomicity.rs` — equivalent tests for `confirm_trial_offer`, including the `TrialOfferAlreadyConfirmed` double-confirm guard.
+> - `contracts/progress/tests/issue_811_idempotency.rs` — audits the shared `advance_level` call target itself: pins the non-idempotent double-apply behaviour, proves rejected calls leave no partial state, and proves the `AlreadyAtMaxLevel` / `InvalidProgressTransition` fail-closed paths.
 >
 > **Idempotency defense-in-depth:** The `DuplicateEvidence` check (code 16) on `approve_milestone` acts as an explicit idempotency token: if a future refactor altered write ordering and partial state were committed, a retried call with the same evidence hash would return `DuplicateEvidence` rather than silently double-counting. For `confirm_trial_offer`, the absence of the `TrialEscrow` record (removed on first confirmation) serves the same purpose — a second call returns `TrialOfferAlreadyConfirmed` (code 22).
 
@@ -586,7 +604,7 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
 
 - **Wiring must be re-run after every fresh deployment.** Contract IDs change on each deploy; old wiring references stale IDs.
 - **`initialize` is one-time per contract.** Calling it twice returns `AlreadyInitialized` (code 1). This is not an error — the contract is already ready.
-- **`revoke_validator` takes `Option<String>` for the reason.** Pass `None` if no reason is needed. The old signature without a reason parameter no longer exists.
+- **`revoke_validator` now takes an explicit `RevocationSeverity` as the second parameter.** Pass `RevocationSeverity::Routine` for a routine deactivation (no cascade) or `RevocationSeverity::ForCause` for a misconduct revocation that flags all prior milestone approvals as pending re-review. Pass `None` for reason if no reason is needed. The old single-`reason` signature no longer exists — update all callers. For validators with more than 50 prior approvals, call `continue_revocation_cascade(wallet)` (admin only) one or more times until the `revocation_cascade_complete` event is emitted.
 - **`log_trial_offer` does NOT immediately advance the player's level.** It records the offer and escrows a fee. Level advancement happens in `confirm_trial_offer`, which must be called by the player wallet.
 - **Trial offer two-step flow:** `log_trial_offer` (scout) → `confirm_trial_offer` (player). Missing the confirmation step means the player stays at Level 2.
 - **Admin rotation is two-step.** Current admin calls `propose_admin`, then the pending address calls `accept_admin`. The old admin remains active until acceptance.
