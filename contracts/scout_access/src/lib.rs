@@ -851,6 +851,43 @@ impl ScoutAccessContract {
     // Pay-to-contact
     // -------------------------------------------------------------------------
 
+    /// Helper: resolve the effective Pro-tier contact limit for a scout.
+    ///
+    /// If the scout has a registered region (from the registration contract) and
+    /// a per-region override has been set for that region, return the override.
+    /// Otherwise fall back to the platform-wide `FeeConfig.pro_contact_limit`.
+    fn effective_pro_contact_limit(env: &Env, scout: &Address) -> u32 {
+        let config = Self::fee_config(env);
+        let platform_default = config.pro_contact_limit;
+
+        // Attempt to look up the scout's region from the registration contract.
+        let reg_contract_addr = match env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+        {
+            Some(addr) => addr,
+            None => return platform_default,
+        };
+
+        let reg_client = registration_contract::Client::new(env, &reg_contract_addr);
+        let scout_profile = match reg_client.try_get_scout_by_wallet(scout) {
+            Ok(profile) => profile,
+            Err(_) => return platform_default,
+        };
+
+        // Check for a regional override.
+        if let Some(limit) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::RegionalContactLimit(scout_profile.region))
+        {
+            return limit;
+        }
+
+        platform_default
+    }
+
     /// Helper: check Pro tier contact quota with a specific count (batch support).
     fn check_pro_contact_quota_with_count(
         env: &Env,
@@ -888,8 +925,7 @@ impl ScoutAccessContract {
             0u32
         };
 
-        let config = Self::fee_config(env);
-        let limit = config.pro_contact_limit;
+        let limit = Self::effective_pro_contact_limit(env, scout);
 
         if current.saturating_add(requested) > limit {
             return Err(ScoutAccessError::ProContactLimitReached);
@@ -1033,7 +1069,7 @@ impl ScoutAccessContract {
             } else {
                 0u32
             };
-            if current_count >= config.pro_contact_limit {
+            if current_count >= Self::effective_pro_contact_limit(&env, &scout) {
                 return Err(ScoutAccessError::ProContactLimitReached);
             }
             let new_period = ProContactPeriod {

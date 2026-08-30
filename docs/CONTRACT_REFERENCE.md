@@ -2944,6 +2944,12 @@ greater than zero; either function returns `InvalidInput` otherwise.
   `ProContactLimitReached` (code 20) for that scout until their subscription
   renews. **Elite-tier scouts are exempt** from this limit and may contact any
   number of players regardless of `pro_contact_limit`.
+
+  > **Per-region overrides**: admins may configure a different limit for scouts
+  > in specific regions using `set_regional_contact_limit(region, limit)`. When
+  > set, the regional value takes precedence over this platform-wide default for
+  > scouts whose registered `region` matches. See the
+  > `set_regional_contact_limit` function reference below for details.
 - `trial_offer_escrow_stroops` must be > 0 (zero or negative → `InvalidInput`). This is the XLM amount held in escrow when a scout logs a trial offer.
 - `trial_offer_expiry_secs` must be > 0 (zero → `InvalidInput`). This defines the window within which a player must confirm a trial offer before it expires and the escrow is refunded.
 - There is no enforced upper bound on fee fields, but values larger than the XLM supply
@@ -3384,6 +3390,55 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
   -- refund_subscription \
   --scout $SCOUT_ADDRESS \
   --amount 1000000
+```
+
+---
+
+#### `set_regional_contact_limit(region: String, limit: u32) -> Result<(), ScoutAccessError>`
+
+Set or update a per-region Pro-tier contact limit override.
+
+When a Pro-tier scout calls `pay_to_contact` or `batch_contact_players`, the
+quota check first looks for a regional override keyed by the scout's registered
+`region` (from the registration contract). If an override exists it is used
+**instead of** `FeeConfig.pro_contact_limit`. If no override exists the
+platform-wide default applies (backward-compatible fallback).
+
+Override storage is bounded (one `u32` per region string) and admin-managed
+only — scouts cannot alter their own quota.
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `Unauthorized` · `InvalidInput` (limit = 0) |
+| **Emits** | `regional_contact_limit_set` with `(admin, region, limit)` |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- set_regional_contact_limit \
+  --region "North America" \
+  --limit 20
+```
+
+---
+
+#### `remove_regional_contact_limit(region: String) -> Result<(), ScoutAccessError>`
+
+Remove a previously-set per-region Pro-tier contact limit override.
+
+After removal, scouts in that region fall back to the platform-wide
+`FeeConfig.pro_contact_limit`. No-ops silently if no override existed for the
+given region.
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `Unauthorized` |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- remove_regional_contact_limit \
+  --region "North America"
 ```
 
 ---
@@ -3896,6 +3951,29 @@ keeping the immediately-previous configs readable on-chain without additional in
 
 ```bash
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID -- get_fee_config_history
+```
+
+---
+
+#### `get_regional_contact_limit(region: String) -> u32`
+
+Return the effective Pro-tier contact limit for the given `region`.
+
+If a per-region override has been set via `set_regional_contact_limit`, that
+value is returned. Otherwise the platform-wide `FeeConfig.pro_contact_limit`
+is returned as the fallback. This is the same value the quota check inside
+`pay_to_contact` and `batch_contact_players` uses for scouts registered in
+that region.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- get_regional_contact_limit \
+  --region "North America"
 ```
 
 ---
