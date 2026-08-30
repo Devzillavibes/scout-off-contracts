@@ -32,6 +32,10 @@ const MAX_VALIDATORS: u32 = 100;
 
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// Instance TTL bump — keeps the instance entry alive on every entrypoint call.
+const INSTANCE_TTL_MIN: u32 = 100;
+const INSTANCE_TTL_MAX: u32 = 500;
+
 // Persistent storage TTL bump for milestone records and admin key.
 const PERSISTENT_TTL_MIN: u32 = 500;
 const PERSISTENT_TTL_MAX: u32 = 2_000;
@@ -87,6 +91,7 @@ impl VerificationContract {
     // -------------------------------------------------------------------------
 
     pub fn initialize(env: Env, admin: Address) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(VerificationError::AlreadyInitialized);
         }
@@ -109,6 +114,7 @@ impl VerificationContract {
         env: Env,
         progress_contract: Address,
     ) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         Self::require_admin(&env)?;
         if env.storage().instance().has(&DataKey::ProgressContractSet) {
             return Err(VerificationError::AlreadyConfigured);
@@ -129,6 +135,7 @@ impl VerificationContract {
         env: Env,
         progress_contract: Address,
     ) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         Self::require_admin(&env)?;
         env.storage()
             .instance()
@@ -143,6 +150,7 @@ impl VerificationContract {
         wallet: Address,
         credentials: String,
     ) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         Self::require_admin(&env)?;
         Self::require_not_paused(&env)?;
 
@@ -188,6 +196,7 @@ impl VerificationContract {
         Ok(())
     }
     pub fn get_validators(env: Env) -> Vec<Address> {
+        Self::bump_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::ValidatorVector)
@@ -201,6 +210,7 @@ impl VerificationContract {
         wallet: Address,
         reason: Option<String>,
     ) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         Self::require_admin(&env)?;
 
         if let Some(ref r) = reason {
@@ -223,6 +233,7 @@ impl VerificationContract {
     }
 
     pub fn pause_contract(env: Env) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         Self::require_admin(&env)?;
         let admin: Address = env
             .storage()
@@ -236,6 +247,7 @@ impl VerificationContract {
     }
 
     pub fn unpause_contract(env: Env) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         Self::require_admin(&env)?;
         let admin: Address = env
             .storage()
@@ -251,6 +263,7 @@ impl VerificationContract {
     /// Upgrade the contract WASM. Admin auth required.
     /// Persistent storage (including Admin) survives this call.
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         Self::require_admin(&env)?;
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
@@ -277,6 +290,7 @@ impl VerificationContract {
         description: String,
         evidence_hash: String,
     ) -> Result<u32, VerificationError> {
+        Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env)?;
         validator_wallet.require_auth();
 
@@ -389,6 +403,7 @@ impl VerificationContract {
         player_id: u64,
         index: u32,
     ) -> Result<Milestone, VerificationError> {
+        Self::bump_instance_ttl(&env);
         let milestone = env
             .storage()
             .persistent()
@@ -401,6 +416,7 @@ impl VerificationContract {
     }
 
     pub fn get_milestone_count(env: Env, player_id: u64) -> u32 {
+        Self::bump_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::MilestoneCounter(player_id))
@@ -408,6 +424,7 @@ impl VerificationContract {
     }
 
     pub fn get_validator_milestone_count(env: Env, wallet: Address) -> u32 {
+        Self::bump_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::ValidatorMilestoneCount(wallet))
@@ -415,6 +432,7 @@ impl VerificationContract {
     }
 
     pub fn get_total_milestone_count(env: Env) -> u32 {
+        Self::bump_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::TotalMilestoneCount)
@@ -422,6 +440,7 @@ impl VerificationContract {
     }
 
     pub fn get_validator(env: Env, wallet: Address) -> Result<Validator, VerificationError> {
+        Self::bump_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::Validator(wallet))
@@ -430,6 +449,7 @@ impl VerificationContract {
 
     /// Returns the detailed status of a validator wallet.
     pub fn get_validator_status(env: Env, wallet: Address) -> ValidatorStatus {
+        Self::bump_instance_ttl(&env);
         match env
             .storage()
             .persistent()
@@ -444,10 +464,12 @@ impl VerificationContract {
     /// Deprecated: use `get_validator_status` instead.
     /// Returns true only for registered, active validators.
     pub fn is_active_validator(env: Env, wallet: Address) -> bool {
+        Self::bump_instance_ttl(&env);
         Self::get_validator_status(env, wallet) == ValidatorStatus::Active
     }
 
     pub fn health(env: Env) -> ContractHealth {
+        Self::bump_instance_ttl(&env);
         let initialized = env
             .storage()
             .instance()
@@ -466,12 +488,20 @@ impl VerificationContract {
 
     /// Returns the deployed crate version (from Cargo.toml at build time).
     pub fn version(env: Env) -> String {
+        Self::bump_instance_ttl(&env);
         String::from_str(&env, CONTRACT_VERSION)
     }
 
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    #[inline(always)]
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_MIN, INSTANCE_TTL_MAX);
+    }
 
     fn require_admin(env: &Env) -> Result<(), VerificationError> {
         let admin: Address = env
