@@ -17,4 +17,9 @@ pub enum ScoutChainError {
     Overflow = 11,
     ScoutNotFound = 12,
     InvalidInput = 13,
+    ValidatorCapReached = 14,
+    PlayerCapReached = 15,
+    RegistrationCooldown = 16,
+    PlayerRecordEvicted = 17,
+    ScoutRecordEvicted = 18,
 }

@@ -11,4 +11,12 @@ pub enum ProgressError {
     InvalidProgressTransition = 5,
     AlreadyAtMaxLevel = 6,
     PlayerNotFound = 7,
+    HistoryNotFound = 8,
+    InvalidHistoryEntry = 9,
+    ProgressRecordEvicted = 10,
+    MigrationNotActive = 11,
+    HistoryAlreadyExists = 12,
+    MerkleRootMismatch = 13,
+    InvalidHistoryIndex = 14,
+    PlayerLevelRecordEvicted = 15,
 }

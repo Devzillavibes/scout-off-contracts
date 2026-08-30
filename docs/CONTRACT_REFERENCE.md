@@ -79,6 +79,26 @@ Maintains the tamper-proof four-tier level state machine.
 | `pause_contract()` / `unpause_contract()` | admin | Circuit breaker |
 | `health()` | — | Returns true if initialized |
 
+### ProgressError Codes
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 1 | `AlreadyInitialized` | Contract has already been initialized |
+| 2 | `NotInitialized` | Contract has not been initialized yet |
+| 3 | `ContractPaused` | Contract is paused by the emergency circuit breaker |
+| 4 | `Unauthorized` | Caller is not authorized for the requested operation |
+| 5 | `InvalidProgressTransition` | Requested level transition is not allowed |
+| 6 | `AlreadyAtMaxLevel` | Player is already at the maximum progress level (EliteTier) |
+| 7 | `PlayerNotFound` | Player ID does not exist in progress storage |
+| 8 | `HistoryNotFound` | Progress history record does not exist for this player |
+| 9 | `InvalidHistoryEntry` | History entry data is malformed or inconsistent |
+| 10 | `ProgressRecordEvicted` | Progress record was evicted from contract storage |
+| 11 | `MigrationNotActive` | Migration operation attempted when no migration is in progress |
+| 12 | `HistoryAlreadyExists` | History entry for this level already exists for the player |
+| 13 | `MerkleRootMismatch` | Provided Merkle root does not match the stored root |
+| 14 | `InvalidHistoryIndex` | Requested history index is out of bounds |
+| 15 | `PlayerLevelRecordEvicted` | Player level record was evicted from contract storage |
+
 ---
 
 ## scout_access
