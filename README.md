@@ -405,7 +405,9 @@ See `bindings/README.md` for usage details.
 
 ## Database Schema
 
-`migrations/001_initial_schema.sql` creates the fourteen PostgreSQL tables the backend event indexer needs:
+The `migrations/` directory contains the PostgreSQL migration files the backend event indexer needs. **Run every file in numeric order** — skipping any migration leaves tables, columns, or indexes missing and causes silent indexer errors at runtime.
+
+`migrations/001_initial_schema.sql` creates the fourteen base PostgreSQL tables:
 
 | Table | Purpose |
 |-------|---------|
@@ -424,13 +426,30 @@ See `bindings/README.md` for usage details.
 | `admin_transfers` | Audit trail of admin rotations across contracts |
 | `indexer_cursor` | Horizon event stream checkpoint (single row) |
 
-Run it against your backend PostgreSQL instance:
+Subsequent migrations add additional tables and columns:
+
+| Migration | What it adds |
+|-----------|-------------|
+| `002_cursor_upsert_helper.sql` | `advance_indexer_cursor()` helper function |
+| `003_diagnostic_events.sql` | `diagnostic_events` table |
+| `004_evidence_access_grants.sql` | `evidence_access_grants` table |
+| `004_scout_subscriptions_auto_renew.sql` | `auto_renew` column on `scout_subscriptions` |
+| `005_dispute_jury.sql` | Jury columns on `milestone_disputes`; `dispute_votes` table |
+| `005_milestone_flags.sql` | `milestone_flags` and `revocation_records` tables |
+
+Run all migrations against your backend PostgreSQL instance:
 
 ```bash
 psql $DATABASE_URL -f migrations/001_initial_schema.sql
+psql $DATABASE_URL -f migrations/002_cursor_upsert_helper.sql
+psql $DATABASE_URL -f migrations/003_diagnostic_events.sql
+psql $DATABASE_URL -f migrations/004_evidence_access_grants.sql
+psql $DATABASE_URL -f migrations/004_scout_subscriptions_auto_renew.sql
+psql $DATABASE_URL -f migrations/005_dispute_jury.sql
+psql $DATABASE_URL -f migrations/005_milestone_flags.sql
 ```
 
-The migration is idempotent and safe to re-run against an already-migrated database: every table and index uses `IF NOT EXISTS`, and the seed row uses `ON CONFLICT DO NOTHING`.
+All migrations are idempotent and safe to re-run against an already-migrated database. See `migrations/README.md` for apply-order notes and details on files that share a numeric prefix.
 
 To verify this database's copy of on-chain state hasn't drifted from the
 contracts, see [`scripts/reconcile-indexer.js`](scripts/reconcile-indexer.js)
