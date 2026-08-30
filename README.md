@@ -129,7 +129,7 @@ Progress levels are configured per player and enforced on-chain by authorized va
 - `subscribe(scout_wallet, tier)` — Purchase a scout subscription to access filtered talent pool
 - `pay_to_contact(player_id, scout_wallet)` — Pay micro-fee to unlock premium data or initiate direct contact
 - `log_trial_offer(player_id, scout_wallet, details_hash)` — Record a trial offer on-chain and escrow the trial fee (step 1 of 2; does not advance the player's level)
-- `confirm_trial_offer(player_id, index, player_wallet)` — Player confirms a pending trial offer before it expires, releasing the escrow and advancing the player to Level 3 (step 2 of 2)
+- `confirm_trial_offer(player_wallet, player_id, index, idempotency_nonce)` — Player confirms a pending trial offer before it expires, releasing the escrow and advancing the player to Level 3 (step 2 of 2)
 
 ### Subscription Tier Access
 
