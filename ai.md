@@ -1,6 +1,6 @@
 # ScoutChain — AI Integration Guide
 
-> **Last reviewed:** 2026-07-24
+> **Last reviewed:** 2026-08-30
 > **Contract version:** see `version()` on each deployed contract
 > **Repo root:** `scout-off-contracts/`
 >

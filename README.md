@@ -679,6 +679,7 @@ Each contract defines its own error enum. The same numeric code can mean differe
 | 7 | `PlayerNotFound` | History index out of range | Verify index against `get_history_count` |
 | 8 | `Overflow` | History counter overflowed | Contact admin |
 | 9 | `RegistrationCallFailed` | Cross-contract call to registration contract failed | Verify the registration contract is deployed and wired |
+| 10 | `PendingAdminNotSet` | `accept_admin` called without a prior `propose_admin` | Call `propose_admin` first, then have the proposed address call `accept_admin` |
 
 ### `ScoutAccessError` (scout_access contract)
 
@@ -706,25 +707,42 @@ Each contract defines its own error enum. The same numeric code can mean differe
 | 21 | `PendingAdminNotSet` | `accept_admin` called before an admin transfer was proposed | Call `propose_admin` first, then have the proposed address call `accept_admin` |
 | 22 | `TrialOfferAlreadyConfirmed` | `confirm_trial_offer` called twice for the same offer | No action; the offer was already confirmed |
 | 23 | `TrialOfferExpired` | Legacy error code retained for compatibility; expiry confirmation now commits the refund and returns success | Log a new trial offer after the refund event |
-| 24 | `AutoRenewNotEnabled` | `renew_if_due` called but the scout has not opted in to auto-renewal | Call `set_auto_renew` with `enabled = true` first |
 
 ## Events
 
+Comprehensive event reference is available in [`ai.md`](ai.md#events-reference). Below is a summary of the main events:
+
 | Event | Emitted When |
 |-------|-------------|
+| `contract_initialized` | Contract initialization completes (registration, verification, progress, or scout_access) |
 | `player_registered` | New player profile created on-chain |
+| `validator_registered` | New validator registered in the verification contract |
 | `milestone_approved` | Validator confirms a player achievement |
+| `milestone_disputed` | Player files a dispute against an approved milestone |
+| `dispute_resolved` | Admin resolves a milestone dispute |
+| `validator_revoked` | Validator is deactivated by admin |
+| `validator_restored` | Validator account is re-activated |
+| `validator_transferred` | Validator wallet address is transferred to a new address |
 | `progress_updated` | Player advances to a new level |
+| `player_level_reset` | Admin resets player progress level (dispute resolution only) |
 | `scout_subscribed` | Scout purchases a talent access subscription (legacy event, emitted alongside `subscription_created` or `subscription_renewed`) |
 | `subscription_created` | Scout purchases their very first subscription |
 | `subscription_renewed` | Scout renews or upgrades an existing subscription |
+| `subscription_refunded` | Scout subscription refunded (e.g., downgrade or expiry) |
 | `player_contacted` | Scout pays to unlock player contact details |
 | `trial_offer_logged` | Scout records a trial offer and escrows the trial fee (does not advance the level) |
 | `trial_offer_confirmed` | Player confirms a pending trial offer before its expiry window closes, releasing the escrow and advancing the player to Level 3 |
 | `trial_offer_expired` | Trial offer confirmation window elapsed; escrowed fee refunded to scout |
+| `fee_config_updated` | Admin updates subscription or contact fee rates |
 | `fees_withdrawn` | Admin withdraws accumulated platform fees |
+| `contract_paused` | Admin pauses the contract (circuit breaker activated) |
+| `contract_unpaused` | Admin unpauses the contract (circuit breaker deactivated) |
 | `admin_transfer_proposed` | Current admin proposes a replacement address |
 | `admin_transferred` | Pending admin accepts control |
+| `progress_contract_updated` | Admin re-wires the progress contract link |
+| `level_advancement_skipped` | Milestone approval skipped advancement (player already at max level) |
+| `progress_contract_not_set` | Diagnostic: progress contract wiring link is missing (emitted on-chain; check logs) |
+| `progress_call_failed` | Diagnostic: cross-contract call to progress contract failed (diagnostic-only; check receipts) |
 
 ## Why Stellar
 
