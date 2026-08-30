@@ -312,21 +312,26 @@ pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ScoutAccessErr
 
 ## Cross-Contract Wiring
 
-Five links must be established after every fresh deployment. `initialize.sh` sets all five automatically. Run the diagnostic script to check which links are present:
+Eight peer-address links must be established after every fresh deployment. `initialize.sh` sets all eight automatically. Run the diagnostic script to check which links are present:
 
 ```bash
 ./scripts/verify-cross-contract-wiring.sh testnet
 ```
 
-### The five wiring links
+### The eight wiring links
 
 | # | Command | What it does |
 |---|---------|-------------|
 | 1 | `verification.set_progress_contract` | Allows `approve_milestone` to call `advance_level` |
-| 2 | `registration.set_progress_contract` | Allows `progress.reset_player_level` to sync level to registration |
-| 3 | `progress.set_verification_contract` | Whitelists verification as authorized caller of `advance_level` |
-| 4 | `progress.set_registration_contract` | Allows progress to call `set_player_level` on registration |
-| 5 | `scout_access.set_progress_contract` | Allows `confirm_trial_offer` to call `advance_level` for Level 3 |
+| 2 | `verification.set_registration_contract` | Allows the dispute-milestone wallet-to-`player_id` binding check |
+| 3 | `registration.set_progress_contract` | Lets `filter_players` resolve player levels at query time |
+| 4 | `progress.set_verification_contract` | Whitelists verification as authorized caller of `advance_level` |
+| 5 | `progress.set_registration_contract` | Allows progress to call `set_player_level` on registration |
+| 6 | `progress.set_scout_access_contract` | Whitelists scout_access as authorized caller of `advance_level` |
+| 7 | `scout_access.set_progress_contract` | Allows `confirm_trial_offer` to call `advance_level` for Level 3 |
+| 8 | `scout_access.set_registration_contract` | Pro-tier scout verification / Sybil gating lookups |
+
+This list matches what `scripts/verify-cross-contract-wiring.sh` checks and the "Full Picture" table in [`docs/WIRING_REGISTRY_DESIGN.md`](docs/WIRING_REGISTRY_DESIGN.md).
 
 ### Manual wiring commands
 
@@ -336,25 +341,40 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_progress_contract --progress_contract $PROGRESS_CONTRACT_ID
 
-# 2. Registration ← Progress
+# 2. Verification → Registration
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  --source $ADMIN_ADDRESS --network testnet \
+  -- set_registration_contract --reg_contract $REGISTRATION_CONTRACT_ID
+
+# 3. Registration → Progress
 stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_progress_contract --addr $PROGRESS_CONTRACT_ID
 
-# 3. Progress → Verification
+# 4. Progress → Verification
 stellar contract invoke --id $PROGRESS_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_verification_contract --addr $VERIFICATION_CONTRACT_ID
 
-# 4. Progress → Registration
+# 5. Progress → Registration
 stellar contract invoke --id $PROGRESS_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_registration_contract --addr $REGISTRATION_CONTRACT_ID
 
-# 5. Scout Access → Progress
+# 6. Progress → Scout Access
+stellar contract invoke --id $PROGRESS_CONTRACT_ID \
+  --source $ADMIN_ADDRESS --network testnet \
+  -- set_scout_access_contract --addr $SCOUT_ACCESS_CONTRACT_ID
+
+# 7. Scout Access → Progress
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
   --source $ADMIN_ADDRESS --network testnet \
   -- set_progress_contract --addr $PROGRESS_CONTRACT_ID
+
+# 8. Scout Access → Registration
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  --source $ADMIN_ADDRESS --network testnet \
+  -- set_registration_contract --addr $REGISTRATION_CONTRACT_ID
 ```
 
 > **Note:** `verification.set_progress_contract` is first-call-only and returns
@@ -513,7 +533,7 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
    ```bash
    ./scripts/verify-cross-contract-wiring.sh testnet
    ```
-   It checks all five documented wiring links: `verification.set_progress_contract`, `registration.set_progress_contract`, `progress.set_verification_contract`, `progress.set_registration_contract`, and `scout_access.set_progress_contract`.
+   It checks all eight documented wiring links: `verification.set_progress_contract`, `verification.set_registration_contract`, `registration.set_progress_contract`, `progress.set_verification_contract`, `progress.set_registration_contract`, `progress.set_scout_access_contract`, `scout_access.set_progress_contract`, and `scout_access.set_registration_contract`.
 2. Re-wire if any link shows ❌:
    ```bash
    ./scripts/initialize.sh testnet
