@@ -510,6 +510,18 @@ impl ProgressContract {
             .get(&DataKey::HistoryCounter(player_id))
             .unwrap_or(0u32);
 
+        // Read-side keep-alive (issue #1191): a player whose history is only
+        // ever read through the paginated getters must not have that history
+        // archived. Extend the counter so the read path itself keeps it alive,
+        // matching the write-side and `get_progress_history` behaviour.
+        if count > 0 {
+            env.storage().persistent().extend_ttl(
+                &DataKey::HistoryCounter(player_id),
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
+            );
+        }
+
         if offset >= count {
             return Vec::new(&env);
         }
@@ -520,11 +532,13 @@ impl ProgressContract {
 
         let mut entries: Vec<ProgressEntry> = Vec::new(&env);
         for i in start..=end {
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get(&DataKey::HistoryEntry(player_id, i))
-            {
+            let key = DataKey::HistoryEntry(player_id, i);
+            if let Some(entry) = env.storage().persistent().get(&key) {
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    PERSISTENT_TTL_MIN,
+                    PERSISTENT_TTL_MAX,
+                );
                 entries.push_back(entry);
             }
         }
@@ -584,11 +598,24 @@ impl ProgressContract {
         // for this logical cursor, even if advance_level is called concurrently.
         let snapshot_count: u32 = match cursor_snapshot {
             Some(s) => s,
-            None => env
-                .storage()
-                .persistent()
-                .get(&DataKey::HistoryCounter(player_id))
-                .unwrap_or(0u32),
+            None => {
+                let c: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::HistoryCounter(player_id))
+                    .unwrap_or(0u32);
+                // Read-side keep-alive (issue #1191): refresh the counter TTL on
+                // the first call of a cursor pass so history browsed only through
+                // this path isn't archived.
+                if c > 0 {
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::HistoryCounter(player_id),
+                        PERSISTENT_TTL_MIN,
+                        PERSISTENT_TTL_MAX,
+                    );
+                }
+                c
+            }
         };
 
         let next_index: u32 = cursor_next_index.unwrap_or(1);
@@ -603,11 +630,13 @@ impl ProgressContract {
 
         let mut entries: Vec<ProgressEntry> = Vec::new(&env);
         for i in next_index..=end {
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get(&DataKey::HistoryEntry(player_id, i))
-            {
+            let key = DataKey::HistoryEntry(player_id, i);
+            if let Some(entry) = env.storage().persistent().get(&key) {
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    PERSISTENT_TTL_MIN,
+                    PERSISTENT_TTL_MAX,
+                );
                 entries.push_back(entry);
             }
         }
@@ -1607,6 +1636,80 @@ mod tests {
         let entry = client.get_history_entry(&player_id, &1u32);
         assert_eq!(entry.old_level, ProgressLevel::Unverified);
         assert_eq!(entry.new_level, ProgressLevel::VerifiedIdentity);
+    }
+
+    // #1191: history read ONLY through get_progress_history_page must stay
+    // accessible across a long ledger span. The read path must extend the TTL
+    // of the HistoryCounter and every HistoryEntry it touches; otherwise the
+    // write-side extension decays and the history is archived while a UI is
+    // still actively browsing it.
+    #[test]
+    fn test_get_progress_history_page_keeps_history_alive() {
+        use soroban_sdk::testutils::Ledger;
+        let (env, client, validator) = setup();
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100_000;
+            l.min_persistent_entry_ttl = 500;
+            l.max_entry_ttl = 600_000;
+        });
+
+        // Write three history entries; each write extends TTL to
+        // 100_000 + PERSISTENT_TTL_MAX (= 618_400).
+        let player_id = 55u64;
+        client.advance_level(&validator, &player_id, &1u32);
+        client.advance_level(&validator, &player_id, &2u32);
+        client.advance_level(&validator, &player_id, &3u32);
+
+        // Move partway through the write-side TTL and read ONLY via the
+        // paginated getter — this must re-extend the history keys.
+        env.ledger().with_mut(|l| l.sequence_number = 500_000);
+        let page = client.get_progress_history_page(&player_id, &0u32, &50u32);
+        assert_eq!(page.len(), 3);
+
+        // Advance past the original write-side TTL (618_400). Without the
+        // read-side extension the counter/entries would now be archived.
+        env.ledger().with_mut(|l| l.sequence_number = 900_000);
+        let page = client.get_progress_history_page(&player_id, &0u32, &50u32);
+        assert_eq!(
+            page.len(),
+            3,
+            "history read only via the paginated getter must stay accessible"
+        );
+    }
+
+    // #1191: same keep-alive guarantee for the cursor-based paginated getter.
+    #[test]
+    fn test_get_history_page_with_cursor_keeps_history_alive() {
+        use soroban_sdk::testutils::Ledger;
+        let (env, client, validator) = setup();
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100_000;
+            l.min_persistent_entry_ttl = 500;
+            l.max_entry_ttl = 600_000;
+        });
+
+        let player_id = 55u64;
+        client.advance_level(&validator, &player_id, &1u32);
+        client.advance_level(&validator, &player_id, &2u32);
+        client.advance_level(&validator, &player_id, &3u32);
+
+        env.ledger().with_mut(|l| l.sequence_number = 500_000);
+        let (entries, _next, snapshot) =
+            client.get_history_page_with_cursor(&player_id, &None, &None, &50u32);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(snapshot, 3);
+
+        env.ledger().with_mut(|l| l.sequence_number = 900_000);
+        let (entries, _next, snapshot) =
+            client.get_history_page_with_cursor(&player_id, &None, &None, &50u32);
+        assert_eq!(
+            entries.len(),
+            3,
+            "cursor-paginated history must stay accessible across a long span"
+        );
+        assert_eq!(snapshot, 3);
     }
 
     // PlayerLevel TTL must be extended when reset_player_level writes it —
