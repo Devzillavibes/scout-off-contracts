@@ -3044,6 +3044,77 @@ impl VerificationContract {
         Ok(())
     }
 
+    /// Admin seed milestone pending-re-review flag (migration-window-gated).
+    ///
+    /// Sets or clears the `MilestonePendingReReview` flag and updates associated
+    /// count and page indexes directly. Used during contract migration to replay
+    /// milestone flags onto a new contract instance.
+    ///
+    /// Issue #1183: replaces the expensive re-run-cascade approach with a direct
+    /// admin-seed function, matching the pattern of admin_seed_milestone and
+    /// admin_seed_dispute.
+    ///
+    /// ## Authorization
+    /// - Must be invoked by admin during the migration window
+    /// - Called via scripts/replay-state.sh during contract-address migration
+    ///
+    /// ## Idempotency
+    /// Keyed on `(player_id, milestone_index)`. Identical replay → no-op.
+    pub fn admin_seed_milestone_flag(
+        env: Env,
+        player_id: u64,
+        milestone_index: u32,
+        flagged: bool,
+    ) -> Result<(), VerificationError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_migration_active(&env)?;
+
+        let flag_key = DataKey::MilestonePendingReReview(player_id, milestone_index);
+
+        // ── Idempotency ───────────────────────────────────────────────────────
+        let current_flag = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&flag_key)
+            .unwrap_or(false);
+
+        if current_flag == flagged {
+            return Ok(()); // Idempotent: already in desired state
+        }
+
+        // ── Set/Clear flag ────────────────────────────────────────────────────
+        if flagged {
+            env.storage().persistent().set(&flag_key, &true);
+        } else {
+            env.storage().persistent().remove(&flag_key);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&flag_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        // ── Update MilestoneFlaggedCount ──────────────────────────────────────
+        let count_key = DataKey::MilestoneFlaggedCount(player_id);
+        let mut count: u32 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0u32);
+
+        if flagged {
+            count = safe_add_u32(count, 1).map_err(|_| VerificationError::Overflow)?;
+        } else if count > 0 {
+            count = count.saturating_sub(1);
+        }
+
+        env.storage().persistent().set(&count_key, &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        Ok(())
+    }
+
     pub fn health(env: Env) -> ContractHealth {
         let initialized = env
             .storage()
