@@ -42,6 +42,8 @@ cp .env.example .env
 git config core.hooksPath scripts/git-hooks
 ```
 
+Reminder: `core.hooksPath` is a per-clone git config setting, so re-apply it after every fresh clone or when working from a new machine.
+
 ## Before opening a PR
 
 ```bash
@@ -49,21 +51,26 @@ cargo test --workspace          # all tests must pass
 cargo clippy --workspace        # zero warnings
 cargo fmt --all -- --check      # formatting must be clean
 bash scripts/check-docs.sh      # documentation completeness check
+bash scripts/check-event-topic-consistency.sh  # event-topic / docs consistency
+bash scripts/check-error-code-continuity.sh  # append-only error code continuity
+bash scripts/check-cargo-doc.sh  # public-item docs coverage check
 ```
 
 ## CI checks
 
-The repository defines five CI jobs across `.github/workflows/ci.yml` and `.github/workflows/contract-ci.yml`. The table below lists each job, its purpose, and whether it is configured as a **required** status check (i.e., blocks merging to `main`) per GitHub's branch-protection rules.
+The repository defines seven CI jobs across `.github/workflows/ci.yml` and `.github/workflows/contract-ci.yml`. The table below lists each job, its purpose, and whether it is configured as a **required** status check (i.e., blocks merging to `main`) per GitHub's branch-protection rules.
 
 | Job | File | What it checks | Required |
 |-----|------|----------------|----------|
 | `check-todos` | `ci.yml` | Scans `contracts/` for `TODO`/`FIXME`/`HACK`/`XXX` markers — fails if any are found | Yes |
 | `test` | `contract-ci.yml` | Runs `cargo test --workspace` (including each contract's `tests/cost_budget.rs` CPU-instruction cost budget), tests `scoutchain-progress`, uploads a `cpu-cost-budget-<sha>` report artifact, builds WASM release | Yes |
-| `lint` | `contract-ci.yml` | Clippy (deny warnings), `rustfmt` check, shellcheck on shell scripts, docs completeness (`scripts/check-docs.sh`), bindings template validation (`scripts/check-bindings.sh`) | Yes |
-| `bindings-smoke-test` | `contract-ci.yml` | Deploys all contracts to a local Soroban sandbox, generates TypeScript bindings, verifies their structure, and builds each binding package | Yes |
-| `abi-export` | `contract-ci.yml` | Exports contract ABIs to `abi/*.json` using `stellar contract info interface`, validates JSON parseability, measures each contract's optimized WASM size against `ci/wasm-size-budget.json`, and uploads the artifacts; per `docs/VERSIONING.md` the ABI diff is how breaking changes are detected | Yes |
+| `lint` | `contract-ci.yml` | Clippy (deny warnings), `rustfmt` check, shellcheck on all tracked shell scripts, docs completeness (`scripts/check-docs.sh`), event-topic consistency (`scripts/check-event-topic-consistency.sh`), guard-ordering audit (`scripts/check-guard-ordering.sh`), cross-doc consistency (`scripts/check-cross-doc-consistency.sh`), trial-offer flow doc consistency (`scripts/check-trial-offer-flow-consistency.sh`), error-code continuity (`scripts/check-error-code-continuity.sh`), public-item docs coverage (`scripts/check-cargo-doc.sh`), and bindings template validation (`scripts/check-bindings.sh`) | Yes |
+| `bindings-smoke-test` | `contract-ci.yml` | Deploys all contracts to a local Soroban sandbox, initializes them and wires cross-contract links, verifies that wiring (`scripts/verify-cross-contract-wiring.sh`), runs `scripts/health-check.sh` and `scripts/full-readiness-check.sh`, runs `scripts/smoke-test.sh`, generates TypeScript bindings, verifies their structure, builds each binding package, **verifies that every ABI-declared function has a corresponding export in the generated binding** (fails with a clear list of missing exports if any), runs `scripts/migrate-contract-smoke-test.sh` against the already-running sandbox to continuously verify the deploy-old→seed→migrate→replay→before/after-comparison path, and re-runs `scripts/check-docs.sh` | Yes |
+| `abi-export` | `contract-ci.yml` | Exports contract ABIs to `abi/*.json` using `stellar contract info interface`, validates JSON parseability, measures each contract's optimized WASM size against `ci/wasm-size-budget.json` (failing the job if any contract is over budget), and uploads the artifacts; per `docs/VERSIONING.md` the ABI diff is how breaking changes are detected | Yes |
+| `abi-diff` | `contract-ci.yml` | Diffs the PR branch's ABI against the base branch (main/develop), classifies changes as MAJOR/MINOR/PATCH per `docs/VERSIONING.md`, and fails if a MAJOR or MINOR change lacks a matching entry in `CHANGELOG.md`'s Unreleased section and a matching row in `docs/VERSIONING.md`'s Version History table | Yes |
+| `budget-calibration` | `contract-ci.yml` | Downloads the `abi-export` job's ABI and CPU-cost-budget artifacts, runs `scripts/calibrate-budgets.py --headroom 0.20` to check the checked-in size/cost budgets aren't badly out of calibration with measured values, and fails if any measured value exceeds its budget | Not verifiable from this repo alone — configure via `Settings > Branches > main > Require status checks` and confirm here |
 
-> **Note on the audit:** The required-status configuration above reflects the actual branch-protection rules on `main` at the time of writing. Because changing branch-protection settings requires repository admin access, any future update to the required checks must be performed by a maintainer in the repository settings (`Settings > Branches > main > Require status checks`).
+> **Note on the audit:** The "What it checks" column for every job above was re-audited directly against the live job definitions in `.github/workflows/ci.yml` and `.github/workflows/contract-ci.yml`, not just against branch-protection status. The `Required` column reflects the actual branch-protection rules on `main` at the time of writing, except for `budget-calibration`, whose required-status could not be confirmed while auditing this table (see that row). Because changing branch-protection settings requires repository admin access, any future update to the required checks — including confirming `budget-calibration`'s status — must be performed by a maintainer in the repository settings (`Settings > Branches > main > Require status checks`).
 
 ### Why `abi-export` is required
 
@@ -82,7 +89,8 @@ Both files document their own process for intentionally raising a budget when a 
 
 - [ ] New functions have unit tests covering the happy path and at least one error case
 - [ ] Any new `DataKey` variant is documented with a comment
-- [ ] Cross-contract calls are documented with a comment explaining the atomicity guarantee
+- [ ] Cross-contract calls are documented with a `**Cross-contract calls:**` row in the
+  function's `CONTRACT_REFERENCE.md` entry and a comment explaining the atomicity guarantee
 - [ ] `ai.md` is updated if shared types, events, or env vars changed
 - [ ] `docs/CONTRACT_REFERENCE.md` is updated with new functions, events, and error codes *(enforced automatically by `scripts/check-docs.sh` in the CI lint job — the PR will fail if a `pub fn` from any `#[contractimpl]` block lacks a corresponding heading in the docs)*
 
@@ -95,6 +103,14 @@ between existing variants and never renumbered.** This matches the
 `#[contracterror]` variant is a MAJOR breaking change because external
 consumers, on-chain event listeners, and off-chain indexers key off the
 numeric code.
+
+`scripts/check-error-code-continuity.sh` is the automated backstop for this
+policy. It compares every `errors.rs` in the PR branch against `origin/main`
+and fails if any numeric code present in both has a different variant name, or
+if a code that existed in `main` disappears without an explicit `// reserved`
+comment in the new version. This check is now part of the `lint` job in
+`contract-ci.yml`, and it should still be run locally before opening a PR that
+touches an `errors.rs` file as a fast, targeted validation of the same policy.
 
 When adding a new variant:
 
@@ -124,6 +140,14 @@ review from a second team member before merge — these are the trust anchors of
 The validator contract is covered by [`.github/CODEOWNERS`](../.github/CODEOWNERS), which
 requests review from the designated validator-logic owner for changes under
 `/contracts/verification/`.
+
+Beyond `/contracts/verification/`, [`.github/CODEOWNERS`](../.github/CODEOWNERS) also designates
+owners for `/contracts/registration/`, `/contracts/progress/`, `/contracts/scout_access/`, and a
+`*` default covering every remaining path (`docs/`, `scripts/`, `config/`, `migrations/`,
+`bindings/`, and top-level files). The same **Require review from Code Owners** branch-protection
+rule therefore gates changes to those paths once it is enabled by an administrator — there are no
+intentionally owner-less areas of the repository. Owners may be redirected in review if a different
+reviewer is more appropriate for a given contract.
 
 Repository administrators must enable **Require review from Code Owners** in the `main`
 branch-protection rule for this mapping to block merges. Before enabling that rule, confirm
