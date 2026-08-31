@@ -29,15 +29,15 @@ migration.
 
 This breaking change is **intentional and expected**, as documented in:
 
-- `CHANGELOG.md` — v0.4.0 entry with migration guide
-- `docs/VERSIONING.md` — v0.4.0 version history row (MAJOR)
+- `CHANGELOG.md` — v1.0.0 entry with migration guides
+- `docs/VERSIONING.md` — v1.0.0 version history row (MAJOR)
 - `docs/DISPUTE_JURY.md` — design spec (now marked Implemented)
 
 ## Migration path
 
 1. **New deployments:** No action required; the contract is deployed fresh.
 2. **Upgrades from v0.3.0 (verification) on testnet or mainnet:**
-   - Run `migrations/005_dispute_jury.sql` against the indexer PostgreSQL
+   - Run `migrations/006_dispute_jury.sql` against the indexer PostgreSQL
      database **before** activating the new WASM.
    - Existing `MilestoneDispute` storage entries written by v0.3.0 will be
      unreadable after upgrade. Operators must resolve or acknowledge all

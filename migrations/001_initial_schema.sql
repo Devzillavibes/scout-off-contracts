@@ -9,6 +9,10 @@
 -- registration.deactivate_player / reactivate_player have no corresponding
 -- column in this table.  See docs/INDEXER.md — "Known gaps" for details.
 -- -----------------------------------------------------------------------
+-- Note: the deactivated column was added in #837 to track
+-- registration.deactivate_player / reactivate_player events.
+-- This resolves the "Known gap" previously documented in docs/INDEXER.md.
+-- Reconciliation for this column is tracked in #1060.
 CREATE TABLE IF NOT EXISTS players (
     player_id       BIGINT PRIMARY KEY,
     wallet          VARCHAR(56)  NOT NULL UNIQUE,   -- Stellar G-address
