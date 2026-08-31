@@ -570,8 +570,10 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
 | `milestone_approved` | event_name, validator (Address), milestone_index (u32) | player_id (u64), description (String), evidence_hash (String) | ✅ |
 | `validator_registered` | event_name, wallet (Address) | wallet (Address), credentials (String) | ✅ |
 | `validator_revoked` | event_name | wallet (Address), reason (String) | ✅ |
+| `validator_votes_invalidated` | event_name | wallet (Address) | ✅ |
 | `validator_restored` | event_name | wallet (Address) | ✅ |
 | `validator_transferred` | event_name | old_wallet (Address), new_wallet (Address) | ✅ |
+| `milestone_flagged` | event_name, player_id (u64), milestone_index (u32) | () | ✅ |
 | `milestone_disputed` | event_name, player_id (u64), milestone_index (u32) | reason (String) | ✅ |
 | `dispute_resolved` | event_name, player_id (u64), milestone_index (u32) | upheld (bool) | ✅ |
 | `progress_contract_updated` | event_name | new_address (Address) | ✅ |

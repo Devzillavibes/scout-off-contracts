@@ -18,10 +18,20 @@ pub const ADMIN_TRANSFER_PROPOSED: &str = "admin_transfer_proposed";
 pub const ADMIN_TRANSFERRED: &str = "admin_transferred";
 pub const ATTESTATION_RECORDED: &str = "attestation_recorded";
 pub const ATTESTATION_WINDOW_EXPIRED: &str = "attestation_window_expired";
-pub const VALIDATOR_PENDING_VOTES_INVALIDATED: &str = "validator_votes_invalidated";
+pub const VALIDATOR_VOTES_INVALIDATED: &str = "validator_votes_invalidated";
 pub const WIRING_UPDATED: &str = "wiring_updated";
 pub const DISPUTE_VOTE_CAST: &str = "dispute_vote_cast";
 pub const DISPUTE_TALLIED: &str = "dispute_tallied";
+pub const MILESTONE_DISPUTED: &str = "milestone_disputed";
+pub const LEVEL_ADVANCEMENT_SKIPPED: &str = "level_advancement_skipped";
+pub const PROGRESS_CONTRACT_NOT_SET: &str = "progress_contract_not_set";
+pub const PROGRESS_CALL_FAILED: &str = "progress_call_failed";
+pub const VALIDATOR_RECORD_RESTORED: &str = "validator_record_restored";
+pub const MILESTONE_RECORD_RESTORED: &str = "milestone_record_restored";
+pub const MILESTONE_FLAGGED: &str = "milestone_flagged";
+pub const MILESTONE_FLAG_CLEARED: &str = "milestone_flag_cleared";
+pub const REVOCATION_CASCADE_COMPLETE: &str = "revocation_cascade_complete";
+pub const REVOCATION_CASCADE_CONTINUED: &str = "revocation_cascade_continued";
 
 /// topics: (event_name, old_admin)  data: new_admin
 pub fn admin_transfer_proposed(env: &Env, old_admin: &Address, new_admin: &Address) {
@@ -189,7 +199,7 @@ pub fn milestone_disputed(
 ) {
     env.events().publish(
         (
-            Symbol::new(env, "milestone_disputed"),
+            Symbol::new(env, MILESTONE_DISPUTED),
             player_wallet.clone(),
         ),
         (player_id, milestone_index, reason.clone()),
@@ -218,7 +228,7 @@ pub fn dispute_resolved(
 /// failed the affiliation-diversity or region-quorum requirement).
 pub fn level_advancement_skipped(env: &Env, player_id: u64, reason: &String) {
     env.events().publish(
-        (Symbol::new(env, "level_advancement_skipped"), player_id),
+        (Symbol::new(env, LEVEL_ADVANCEMENT_SKIPPED), player_id),
         reason.clone(),
     );
 }
@@ -229,7 +239,7 @@ pub fn level_advancement_skipped(env: &Env, player_id: u64, reason: &String) {
 /// indexer should alert on it.  The milestone is still persisted.
 pub fn progress_contract_not_set(env: &Env, player_id: u64) {
     env.events().publish(
-        (Symbol::new(env, "progress_contract_not_set"), player_id),
+        (Symbol::new(env, PROGRESS_CONTRACT_NOT_SET), player_id),
         (),
     );
 }
@@ -269,7 +279,7 @@ pub fn attestation_window_expired(
 /// Emitted when `revoke_validator` retroactively strips a revoked
 /// validator's contribution from still-pending (sub-threshold) claims.
 /// topics: (event_name, admin)  data: (wallet, invalidated_count)
-pub fn validator_pending_votes_invalidated(
+pub fn validator_votes_invalidated(
     env: &Env,
     admin: &Address,
     wallet: &Address,
@@ -277,7 +287,7 @@ pub fn validator_pending_votes_invalidated(
 ) {
     env.events().publish(
         (
-            Symbol::new(env, VALIDATOR_PENDING_VOTES_INVALIDATED),
+            Symbol::new(env, VALIDATOR_VOTES_INVALIDATED),
             admin.clone(),
         ),
         (wallet.clone(), invalidated_count),
@@ -291,7 +301,7 @@ pub fn validator_pending_votes_invalidated(
 /// Payload is the raw error discriminant returned by try_advance_level.
 pub fn progress_call_failed(env: &Env, player_id: u64, error_code: u32) {
     env.events().publish(
-        (Symbol::new(env, "progress_call_failed"), player_id),
+        (Symbol::new(env, PROGRESS_CALL_FAILED), player_id),
         error_code,
     );
 }
@@ -301,7 +311,7 @@ pub fn progress_call_failed(env: &Env, player_id: u64, error_code: u32) {
 /// topics: (event_name, admin)  data: wallet
 pub fn validator_record_restored(env: &Env, admin: &Address, wallet: &Address) {
     env.events().publish(
-        (Symbol::new(env, "validator_record_restored"), admin.clone()),
+        (Symbol::new(env, VALIDATOR_RECORD_RESTORED), admin.clone()),
         wallet.clone(),
     );
 }
@@ -311,7 +321,7 @@ pub fn validator_record_restored(env: &Env, admin: &Address, wallet: &Address) {
 /// topics: (event_name, admin)  data: (player_id, index)
 pub fn milestone_record_restored(env: &Env, admin: &Address, player_id: u64, index: u32) {
     env.events().publish(
-        (Symbol::new(env, "milestone_record_restored"), admin.clone()),
+        (Symbol::new(env, MILESTONE_RECORD_RESTORED), admin.clone()),
         (player_id, index),
     );
 }
@@ -320,14 +330,14 @@ pub fn milestone_record_restored(env: &Env, admin: &Address, player_id: u64, ind
 /// (issue #1039).
 ///
 /// topics: (event_name, validator)  data: (player_id, milestone_index)
-pub fn milestone_flagged_for_rereview(
+pub fn milestone_flagged(
     env: &Env,
     validator: &Address,
     player_id: u64,
     milestone_index: u32,
 ) {
     env.events().publish(
-        (Symbol::new(env, "milestone_flagged"), validator.clone()),
+        (Symbol::new(env, MILESTONE_FLAGGED), validator.clone()),
         (player_id, milestone_index),
     );
 }
@@ -338,7 +348,7 @@ pub fn milestone_flagged_for_rereview(
 /// topics: (event_name, reviewer)  data: (player_id, milestone_index)
 pub fn milestone_flag_cleared(env: &Env, reviewer: &Address, player_id: u64, milestone_index: u32) {
     env.events().publish(
-        (Symbol::new(env, "milestone_flag_cleared"), reviewer.clone()),
+        (Symbol::new(env, MILESTONE_FLAG_CLEARED), reviewer.clone()),
         (player_id, milestone_index),
     );
 }
@@ -351,7 +361,7 @@ pub fn milestone_flag_cleared(env: &Env, reviewer: &Address, player_id: u64, mil
 pub fn revocation_cascade_complete(env: &Env, validator: &Address, total_flagged: u32) {
     env.events().publish(
         (
-            Symbol::new(env, "revocation_cascade_complete"),
+            Symbol::new(env, REVOCATION_CASCADE_COMPLETE),
             validator.clone(),
         ),
         total_flagged,
@@ -370,7 +380,7 @@ pub fn revocation_cascade_continued(
 ) {
     env.events().publish(
         (
-            Symbol::new(env, "revocation_cascade_continued"),
+            Symbol::new(env, REVOCATION_CASCADE_CONTINUED),
             validator.clone(),
         ),
         (next_cursor, flagged_this_call),
