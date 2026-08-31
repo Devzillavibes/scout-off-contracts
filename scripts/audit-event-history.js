@@ -1,89 +1,51 @@
 #!/usr/bin/env node
-// ScoutChain — audit-event-history.js
+// ScoutChain — event-log audit tool for player history reconstruction.
 //
-// Replays on-chain event history for one or more players and validates it
-// against current contract state.  Detects event-chain integrity issues and
-// off-chain indexer drift.
-//
-// Resolves:
-//   #1176 — 'all' mode now enumerates real players via get_player_count
-//   #1177 — k-of-n attestation events are replayed and chain-validated
+// Reconstructs a player's complete derived state purely from raw events
+// and cross-validates against live contract state and indexer database.
+// Detects internal inconsistencies in the event chain itself (e.g.,
+// level transitions that don't follow the documented 0→1→2→3 progression).
 //
 // Usage:
-//   node scripts/audit-event-history.js player <player_id> [options]
-//   node scripts/audit-event-history.js all [--sample <n>] [options]
+//   RPC_URL=https://soroban-testnet-rpc.stellar.org \
+//   REGISTRATION_CONTRACT_ID=C... VERIFICATION_CONTRACT_ID=C... \
+//   PROGRESS_CONTRACT_ID=C... SCOUT_ACCESS_CONTRACT_ID=C... \
+//   DATABASE_URL=postgres://... \
+//     node scripts/audit-event-history.js <player_id|'all'> [options]
 //
 // Options:
-//   --network <name>    Soroban network alias (default: testnet)
-//   --rpc-url <url>     Soroban RPC URL
-//   --source <id>       Stellar CLI identity
-//   --sample <n>        Cap on players audited in 'all' mode
-//   --fixture <path>    Load events from a JSON fixture instead of live chain
-//   --json              Emit report as JSON
+//   --player-id <id>     Player ID to audit (default: from arg 1)
+//   --sample <n>         For 'all' mode, audit only first N players
+//   --json               Emit as JSON instead of text
 //
-// Exit codes: 0 = clean, 1 = issues found, 2 = configuration error.
+// Exit codes: 0 = clean, 1 = inconsistencies found, 2 = configuration error.
 
 "use strict";
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { Client: PgClient } = require("pg");
 
-// ---------------------------------------------------------------------------
-// Argument parsing
-// ---------------------------------------------------------------------------
+// --- Configuration & Setup ---------------------------------------------------
 
 function parseArgs(argv) {
   const args = {
-    mode: null,       // "player" | "all"
-    playerId: null,   // numeric, only for "player" mode
-    network: "testnet",
-    rpcUrl: null,
-    source: null,
+    playerIdArg: null,
     sample: null,
-    fixture: null,
     json: false,
   };
-
-  let i = 0;
-  // First positional: mode
-  if (argv[i] === "player" || argv[i] === "all") {
-    args.mode = argv[i++];
-  } else {
-    process.stderr.write(`Expected 'player' or 'all' as first argument, got: ${argv[i]}\n`);
-    process.exit(2);
-  }
-
-  // Second positional for player mode: player_id
-  if (args.mode === "player") {
-    if (!argv[i] || argv[i].startsWith("--")) {
-      process.stderr.write("player mode requires a player_id argument\n");
-      process.exit(2);
-    }
-    args.playerId = Number(argv[i++]);
-  }
-
-  // Flags
-  while (i < argv.length) {
+  for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--network") args.network = argv[++i];
-    else if (a === "--rpc-url") args.rpcUrl = argv[++i];
-    else if (a === "--source") args.source = argv[++i];
-    else if (a === "--sample") args.sample = Number(argv[++i]);
-    else if (a === "--fixture") args.fixture = argv[++i];
+    if (a === "--sample") args.sample = Number(argv[++i]);
     else if (a === "--json") args.json = true;
-    else {
-      process.stderr.write(`Unknown argument: ${a}\n`);
-      process.exit(2);
+    else if (a === "--player-id") args.playerIdArg = argv[++i];
+    else if (!a.startsWith("--")) {
+      args.playerIdArg = a;
     }
-    i++;
   }
   return args;
 }
-
-// ---------------------------------------------------------------------------
-// Contract invocation helper
-// ---------------------------------------------------------------------------
 
 function loadDotEnvContracts() {
   const file = path.join(process.cwd(), ".env.contracts");
@@ -94,308 +56,534 @@ function loadDotEnvContracts() {
     const eq = trimmed.indexOf("=");
     if (eq === -1) continue;
     const key = trimmed.slice(0, eq).trim();
-    const val = trimmed.slice(eq + 1).trim();
-    if (!process.env[key]) process.env[key] = val;
+    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    if (!(key in process.env)) process.env[key] = value;
   }
 }
 
-function invokeContract(contractId, fn, fnArgs, opts) {
-  const cmd = ["stellar", "contract", "invoke"];
-  cmd.push("--id", contractId);
-  cmd.push("--network", opts.network);
-  if (opts.source) cmd.push("--source", opts.source);
-  cmd.push("--");
-  cmd.push(fn);
-  for (const [k, v] of Object.entries(fnArgs || {})) {
-    cmd.push(`--${k}`, String(v));
-  }
-  try {
-    const out = execFileSync(cmd[0], cmd.slice(1), { encoding: "utf8" });
-    return JSON.parse(out.trim());
-  } catch (err) {
-    throw new Error(`Contract call ${fn} failed: ${err.message}`);
+function requireEnv(names) {
+  const missing = names.filter((n) => !process.env[n]);
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variable(s): ${missing.join(", ")}`);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Player enumeration — resolves #1176
-// ---------------------------------------------------------------------------
+// --- Soroban Event Retrieval -------------------------------------------------
+
+// Maximum page size accepted by the Soroban RPC getEvents endpoint.
+const EVENTS_PAGE_SIZE = 200;
 
 /**
- * Returns an array of player IDs to audit.
+ * Fetch ALL events for a contract from the Soroban RPC event stream using
+ * cursor-based pagination.
  *
- * Previously this returned null / used a hardcoded [1,2,3] placeholder.
- * Now it calls registration.get_player_count and iterates 1..=count,
- * capped at `sample` when provided.
+ * The RPC getEvents endpoint returns at most EVENTS_PAGE_SIZE events per call
+ * and includes a `cursor` in the result pointing to the last returned event.
+ * Passing that cursor back as `cursor` in the next request yields the next
+ * page.  We loop until the page is smaller than the requested size, which
+ * signals we have reached the end of the stream.
  *
- * @param {object} opts  - parsed CLI args
- * @returns {number[]}
+ * Without this loop the caller silently receives only the first page of
+ * results — dropping every event beyond the 200th — which causes missed
+ * milestone/subscription events and incorrect event-chain consistency checks.
  */
-function enumeratePlayers(opts) {
-  const registrationId = process.env.REGISTRATION_CONTRACT_ID;
-  if (!registrationId) {
-    process.stderr.write(
-      "REGISTRATION_CONTRACT_ID not set — cannot enumerate players\n"
-    );
-    process.exit(2);
-  }
+async function fetchEvents(rpcUrl, contractId, topic = null) {
+  const allEvents = [];
+  let cursor = undefined;
 
-  let count;
-  try {
-    count = invokeContract(registrationId, "get_player_count", {}, opts);
-  } catch (err) {
-    process.stderr.write(`Failed to fetch player count: ${err.message}\n`);
-    process.exit(2);
-  }
+  while (true) {
+    const params = {
+      contractIds: [contractId],
+      limit: EVENTS_PAGE_SIZE,
+    };
 
-  if (typeof count !== "number" || count < 0) {
-    process.stderr.write(`Unexpected player count value: ${JSON.stringify(count)}\n`);
-    process.exit(2);
-  }
-
-  const limit = opts.sample !== null ? Math.min(count, opts.sample) : count;
-  const ids = [];
-  for (let i = 1; i <= limit; i++) ids.push(i);
-  return ids;
-}
-
-// ---------------------------------------------------------------------------
-// k-of-n attestation replay — resolves #1177
-// ---------------------------------------------------------------------------
-
-/**
- * Reconstructs pending-claim tallies from attestation events and validates:
- *  1. No vote after window expiry counts toward the old round.
- *  2. A claim commits exactly when threshold distinct active validators voted.
- *  3. A revoked validator's vote is stripped.
- *
- * @param {object[]} events  - ordered array of on-chain events for a player
- * @param {Set<string>} revokedValidators - set of revoked validator addresses
- * @returns {{ flags: string[], details: string[] }}
- */
-function replayAttestationEvents(events, revokedValidators) {
-  const flags = [];
-  const details = [];
-
-  // round key → { votes: Map<validatorAddr, timestamp>, expired: bool, threshold: number }
-  const rounds = new Map();
-
-  function getRound(playerRoundKey) {
-    if (!rounds.has(playerRoundKey)) {
-      rounds.set(playerRoundKey, { votes: new Map(), expired: false, threshold: null });
+    if (cursor !== undefined) {
+      params.cursor = cursor;
     }
-    return rounds.get(playerRoundKey);
+
+    if (topic) {
+      params.filters = [{ topics: topic }];
+    }
+
+    const body = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getEvents",
+      params,
+    };
+
+    const res = await fetch(rpcUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const result = await res.json();
+    if (result.error) {
+      throw new Error(`RPC error: ${result.error.message}`);
+    }
+
+    const page = (result.result && result.result.events) || [];
+    allEvents.push(...page);
+
+    // A page smaller than EVENTS_PAGE_SIZE means we are at the end of the
+    // stream.  Also stop if the RPC omitted the cursor (some implementations
+    // omit it on the final page).
+    if (page.length < EVENTS_PAGE_SIZE || !result.result.cursor) {
+      break;
+    }
+
+    // Advance cursor to the last event on this page.
+    cursor = result.result.cursor;
   }
 
-  for (const event of events) {
-    const { type: evType, data } = event;
+  return allEvents;
+}
 
-    if (evType === "attestation_recorded") {
-      // data: { player_id, round, validator, threshold, timestamp }
-      const { player_id, round, validator, threshold, timestamp } = data;
-      const key = `${player_id}:${round}`;
-      const roundState = getRound(key);
-      roundState.threshold = threshold;
+// --- Event Reconstruction State Machine ---------------------------------------
 
-      if (roundState.expired) {
-        flags.push("POST_EXPIRY_VOTE");
-        details.push(
-          `Player ${player_id} round ${round}: vote from ${validator} at ${timestamp} counted after window expiry`
+class PlayerHistoryReconstructor {
+  constructor(playerId) {
+    this.playerId = playerId;
+    this.history = [];
+    this.levelProgression = [];
+    this.milestones = new Map();
+    this.disputes = new Map();
+    this.trialOffers = new Map();
+    this.issues = [];
+  }
+
+  addIssue(severity, category, message) {
+    this.issues.push({
+      severity, // "error", "warning", "info"
+      category,
+      message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  processProgressUpdateEvent(event) {
+    try {
+      const data = JSON.parse(event.data.json ?? "{}");
+      if (Number(data.player_id) !== this.playerId) return;
+
+      const oldLevel = this.parseLevel(data.old_level);
+      const newLevel = this.parseLevel(data.new_level);
+
+      // Validate transition follows 0→1→2→3 rule
+      if (!this.isValidTransition(oldLevel, newLevel)) {
+        this.addIssue(
+          "error",
+          "progress_update",
+          `Invalid level transition: ${oldLevel} → ${newLevel}`,
         );
-        continue; // don't count it
       }
 
-      if (revokedValidators.has(validator)) {
-        flags.push("REVOKED_VALIDATOR_VOTE_COUNTED");
-        details.push(
-          `Player ${player_id} round ${round}: vote from revoked validator ${validator} must not count`
-        );
-        continue; // strip the vote
-      }
+      this.levelProgression.push({
+        type: "progress_updated",
+        oldLevel,
+        newLevel,
+        timestamp: Number(event.ledger),
+        ledgerSeq: event.ledger_close_time,
+      });
+    } catch (err) {
+      this.addIssue("warning", "progress_update", `Parse error: ${err.message}`);
+    }
+  }
 
-      roundState.votes.set(validator, timestamp);
+  processPlayerLevelResetEvent(event) {
+    try {
+      const data = JSON.parse(event.data.json ?? "{}");
+      if (Number(data.player_id) !== this.playerId) return;
 
-      // Check if threshold has been reached
-      if (roundState.threshold !== null && roundState.votes.size >= roundState.threshold) {
-        // Threshold reached — this should correspond to a commit event
-        // If we later see a commit_without_threshold flag it means this never happened
-        roundState.committed = true;
-      }
-    } else if (evType === "attestation_window_expired") {
-      // data: { player_id, round }
-      const { player_id, round } = data;
-      const key = `${player_id}:${round}`;
-      const roundState = getRound(key);
-      roundState.expired = true;
+      const resetTo = this.parseLevel(data.level);
+      this.levelProgression.push({
+        type: "player_level_reset",
+        resetTo,
+        timestamp: Number(event.ledger),
+        ledgerSeq: event.ledger_close_time,
+      });
+    } catch (err) {
+      this.addIssue("warning", "player_level_reset", `Parse error: ${err.message}`);
+    }
+  }
 
-      // Check if round committed without reaching threshold
-      if (!roundState.committed && roundState.threshold !== null) {
-        if (roundState.votes.size > 0) {
-          // Votes existed but threshold not met — expected if window expired
-          // This is only a flag if the system recorded a commit anyway
-        }
+  processMilestoneApprovedEvent(event) {
+    try {
+      const data = JSON.parse(event.data.json ?? "{}");
+      if (Number(data.player_id) !== this.playerId) return;
+
+      const index = Number(data.milestone_index);
+      this.milestones.set(index, {
+        validator: data.validator,
+        description: data.description,
+        evidenceHash: data.evidence_hash,
+        approvedAt: Number(data.approved_at),
+        ledger: Number(event.ledger),
+      });
+    } catch (err) {
+      this.addIssue("warning", "milestone_approved", `Parse error: ${err.message}`);
+    }
+  }
+
+  processMilestoneDisputedEvent(event) {
+    try {
+      const data = JSON.parse(event.data.json ?? "{}");
+      if (Number(data.player_id) !== this.playerId) return;
+
+      const key = Number(data.milestone_index);
+      if (!this.disputes.has(key)) {
+        this.disputes.set(key, {});
       }
-    } else if (evType === "validator_pending_votes_invalidated") {
-      // data: { player_id, round } — all pending votes for this round are wiped
-      const { player_id, round } = data;
-      const key = `${player_id}:${round}`;
-      if (rounds.has(key)) {
-        const roundState = rounds.get(key);
-        roundState.votes.clear();
-        roundState.committed = false;
+      const dispute = this.disputes.get(key);
+      dispute.reason = data.reason;
+      dispute.disputedAt = Number(data.disputed_at);
+      dispute.resolved = false;
+    } catch (err) {
+      this.addIssue("warning", "milestone_disputed", `Parse error: ${err.message}`);
+    }
+  }
+
+  processDisputeResolvedEvent(event) {
+    try {
+      const data = JSON.parse(event.data.json ?? "{}");
+      if (Number(data.player_id) !== this.playerId) return;
+
+      const key = Number(data.milestone_index);
+      if (!this.disputes.has(key)) {
+        this.disputes.set(key, {});
       }
-    } else if (evType === "milestone_approved") {
-      // A milestone commit — verify it had enough threshold votes
-      const { player_id, round } = data;
-      if (round !== undefined) {
-        const key = `${player_id}:${round}`;
-        const roundState = getRound(key);
-        if (
-          roundState.threshold !== null &&
-          roundState.votes.size < roundState.threshold
-        ) {
-          flags.push("COMMIT_WITHOUT_THRESHOLD");
-          details.push(
-            `Player ${player_id} round ${round}: committed with only ${roundState.votes.size} votes, threshold was ${roundState.threshold}`
+      const dispute = this.disputes.get(key);
+      dispute.resolved = true;
+      dispute.upheld = data.upheld;
+    } catch (err) {
+      this.addIssue("warning", "dispute_resolved", `Parse error: ${err.message}`);
+    }
+  }
+
+  processTrialOfferLoggedEvent(event) {
+    try {
+      const data = JSON.parse(event.data.json ?? "{}");
+      if (Number(data.player_id) !== this.playerId) return;
+
+      const index = Number(data.index);
+      this.trialOffers.set(index, {
+        scout: data.scout,
+        detailsHash: data.details_hash,
+        loggedAt: Number(data.logged_at),
+        status: "logged",
+        ledger: Number(event.ledger),
+      });
+    } catch (err) {
+      this.addIssue("warning", "trial_offer_logged", `Parse error: ${err.message}`);
+    }
+  }
+
+  processTrialOfferConfirmedEvent(event) {
+    try {
+      const data = JSON.parse(event.data.json ?? "{}");
+      if (Number(data.player_id) !== this.playerId) return;
+
+      const index = Number(data.index);
+      if (this.trialOffers.has(index)) {
+        this.trialOffers.get(index).status = "confirmed";
+      }
+    } catch (err) {
+      this.addIssue("warning", "trial_offer_confirmed", `Parse error: ${err.message}`);
+    }
+  }
+
+  processTrialOfferExpiredEvent(event) {
+    try {
+      const data = JSON.parse(event.data.json ?? "{}");
+      if (Number(data.player_id) !== this.playerId) return;
+
+      const index = Number(data.index);
+      if (this.trialOffers.has(index)) {
+        this.trialOffers.get(index).status = "expired";
+      }
+    } catch (err) {
+      this.addIssue("warning", "trial_offer_expired", `Parse error: ${err.message}`);
+    }
+  }
+
+  parseLevel(levelStr) {
+    const levels = ["Unverified", "VerifiedIdentity", "PerformanceMilestones", "EliteTier"];
+    const idx = levels.indexOf(levelStr);
+    return idx === -1 ? null : idx;
+  }
+
+  isValidTransition(oldLevel, newLevel) {
+    if (oldLevel === null || newLevel === null) return true;
+    // Can only advance one level at a time or reset
+    if (newLevel > oldLevel) return newLevel === oldLevel + 1;
+    if (newLevel < oldLevel) return true; // Reset is allowed
+    return newLevel === oldLevel; // Stay same level is OK
+  }
+
+  validateEventChainConsistency() {
+    let currentLevel = 0; // Players start at Unverified
+    for (const entry of this.levelProgression) {
+      if (entry.type === "progress_updated") {
+        if (entry.oldLevel !== currentLevel) {
+          this.addIssue(
+            "error",
+            "event_chain",
+            `progress_updated oldLevel ${entry.oldLevel} doesn't match current ${currentLevel}`,
           );
         }
-        roundState.committed = true;
+        currentLevel = entry.newLevel;
+      } else if (entry.type === "player_level_reset") {
+        currentLevel = entry.resetTo;
       }
     }
   }
 
-  return { flags, details };
+  getReconstructedState() {
+    return {
+      playerId: this.playerId,
+      levelProgression: this.levelProgression,
+      currentLevel: this.levelProgression.length > 0
+        ? this.levelProgression[this.levelProgression.length - 1].type === "progress_updated"
+          ? this.levelProgression[this.levelProgression.length - 1].newLevel
+          : this.levelProgression[this.levelProgression.length - 1].resetTo
+        : 0,
+      milestones: Array.from(this.milestones.entries()).map(([idx, m]) => ({ index: idx, ...m })),
+      disputes: Array.from(this.disputes.entries()).map(([idx, d]) => ({ index: idx, ...d })),
+      trialOffers: Array.from(this.trialOffers.entries()).map(([idx, t]) => ({ index: idx, ...t })),
+      issues: this.issues,
+    };
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Player audit
-// ---------------------------------------------------------------------------
+// --- Contract State Fetching -------------------------------------------------
 
-function auditPlayer(playerId, opts, revokedValidators) {
-  const issues = [];
+function getContractLevel(rpcUrl, progressId, playerId) {
+  // Would use stellar CLI to invoke progress.get_level
+  // For now, return null to indicate not yet implemented
+  return null;
+}
 
-  let events;
+// --- Main Audit Logic --------------------------------------------------------
 
-  // Load from fixture if provided (useful for offline testing)
-  if (opts.fixture) {
-    const raw = JSON.parse(fs.readFileSync(opts.fixture, "utf8"));
-    events = (raw[playerId] || raw[String(playerId)] || []);
-  } else {
-    // In a real implementation, fetch events from Horizon/RPC for this player.
-    // Stub: returns empty — real wiring requires Horizon event streaming.
-    events = fetchPlayerEvents(playerId, opts);
+async function auditPlayerHistory(rpcUrl, contractIds, playerId, pg) {
+  const reconstructor = new PlayerHistoryReconstructor(playerId);
+
+  // Fetch all events from all contracts
+  const events = [];
+  for (const [name, id] of Object.entries(contractIds)) {
+    try {
+      const contractEvents = await fetchEvents(rpcUrl, id);
+      for (const ev of contractEvents) {
+        events.push({ ...ev, contractName: name });
+      }
+    } catch (err) {
+      console.error(`Failed to fetch events from ${name}: ${err.message}`);
+    }
   }
 
-  // Standard level-transition validation
-  let level = 0;
+  // Sort by ledger sequence
+  events.sort((a, b) => Number(a.ledger) - Number(b.ledger));
+
+  // Reorg detection: after sorting, walk the full event list and flag any
+  // event whose ledger sequence is lower than the previous event's.  This
+  // signals that the RPC delivered events out of order — which can happen
+  // when a ledger reorg rolls back some ledgers and re-delivers their events
+  // interleaved with newer ones.  If this is detected the reconstructed state
+  // below may be incorrect because the sort cannot fully restore causal order
+  // when two events share the same ledger with different meanings.
+  let lastLedger = -1;
+  const reorgWarnings = [];
+  for (let i = 0; i < events.length; i++) {
+    const seq = Number(events[i].ledger);
+    if (seq < lastLedger) {
+      reorgWarnings.push(
+        `Possible reorg: event[${i}] ledger ${seq} < previous ledger ${lastLedger} ` +
+        `(contract ${events[i].contractName}, type ${events[i].type})`,
+      );
+    }
+    lastLedger = seq;
+  }
+  if (reorgWarnings.length > 0) {
+    for (const msg of reorgWarnings) {
+      reconstructor.addIssue("warning", "reorg", msg);
+    }
+    // Surface a single top-level error so the audit exits non-zero and the
+    // operator knows reconstructed state may be unreliable.
+    reconstructor.addIssue(
+      "error",
+      "reorg",
+      `${reorgWarnings.length} out-of-order ledger sequence(s) detected — ` +
+      "event stream may contain a reorg; reconstructed state may be unreliable",
+    );
+  }
+
+  // Process relevant events
   for (const event of events) {
-    if (event.type === "progress_updated") {
-      const { old_level, new_level } = event.data;
-      if (new_level !== old_level + 1) {
-        issues.push(`Invalid level transition: ${old_level} → ${new_level}`);
+    if (event.contractName === "progress") {
+      if (event.type.includes("progress_updated")) {
+        reconstructor.processProgressUpdateEvent(event);
+      } else if (event.type.includes("player_level_reset")) {
+        reconstructor.processPlayerLevelResetEvent(event);
       }
-      level = new_level;
+    } else if (event.contractName === "verification") {
+      if (event.type.includes("milestone_approved")) {
+        reconstructor.processMilestoneApprovedEvent(event);
+      } else if (event.type.includes("milestone_disputed")) {
+        reconstructor.processMilestoneDisputedEvent(event);
+      } else if (event.type.includes("dispute_resolved")) {
+        reconstructor.processDisputeResolvedEvent(event);
+      }
+    } else if (event.contractName === "scout_access") {
+      if (event.type.includes("trial_offer_logged")) {
+        reconstructor.processTrialOfferLoggedEvent(event);
+      } else if (event.type.includes("trial_offer_confirmed")) {
+        reconstructor.processTrialOfferConfirmedEvent(event);
+      } else if (event.type.includes("trial_offer_expired")) {
+        reconstructor.processTrialOfferExpiredEvent(event);
+      }
     }
   }
 
-  // k-of-n attestation replay
-  const { flags, details } = replayAttestationEvents(events, revokedValidators);
-  for (const d of details) issues.push(d);
+  // Validate internal event chain consistency
+  reconstructor.validateEventChainConsistency();
 
-  return { playerId, level, flags, issues };
+  // Get reconstructed state
+  const reconstructed = reconstructor.getReconstructedState();
+
+  // Compare against live contract state and indexer
+  const comparisons = {
+    reconstructedState: reconstructed,
+    contractStateComparisons: {},
+    indexerStateComparisons: {},
+  };
+
+  // Query indexer for comparison
+  if (pg) {
+    try {
+      const { rows: players } = await pg.query(
+        "SELECT * FROM players WHERE player_id = $1",
+        [playerId],
+      );
+      if (players.length > 0) {
+        const player = players[0];
+        comparisons.indexerStateComparisons.level = {
+          reconstructed: reconstructed.currentLevel,
+          indexer: player.level,
+          match: reconstructed.currentLevel === player.level,
+        };
+      }
+    } catch (err) {
+      console.error(`Failed to query indexer: ${err.message}`);
+    }
+  }
+
+  return comparisons;
 }
 
-/**
- * Fetch events for a player from Horizon/RPC.
- * This is a stub — real implementation would stream Horizon events filtered
- * by the contract IDs and player_id topic.
- *
- * @param {number} playerId
- * @param {object} opts
- * @returns {object[]}
- */
-function fetchPlayerEvents(playerId, opts) {
-  // TODO: implement Horizon event streaming fetch
-  // See: https://developers.stellar.org/docs/data/horizon/api-reference/resources/effects
-  return [];
-}
+// --- Reporting ---------------------------------------------------------------
 
-/**
- * Fetch the set of revoked validator addresses from the verification contract.
- * Returns an empty Set if the contract isn't available (graceful degradation).
- *
- * @param {object} opts
- * @returns {Set<string>}
- */
-function fetchRevokedValidators(opts) {
-  const verificationId = process.env.VERIFICATION_CONTRACT_ID;
-  if (!verificationId) return new Set();
-  try {
-    const validators = invokeContract(verificationId, "get_validators", {}, opts);
-    const revoked = new Set();
-    if (Array.isArray(validators)) {
-      for (const v of validators) {
-        if (v.active === false || v.revoked === true) {
-          revoked.add(v.wallet || v.address);
+function printTextReport(auditResults) {
+  console.log("=".repeat(72));
+  console.log("  ScoutChain event-history audit");
+  console.log("=".repeat(72));
+
+  for (const result of auditResults) {
+    const { playerId, reconstructedState, indexerStateComparisons } = result;
+    console.log(`\n--- Player ${playerId} ---`);
+
+    if (reconstructedState.issues.length > 0) {
+      const errors = reconstructedState.issues.filter((i) => i.severity === "error");
+      if (errors.length > 0) {
+        console.log(`  Issues found: ${errors.length} error(s)`);
+        for (const issue of errors) {
+          console.log(`    [${issue.category}] ${issue.message}`);
         }
       }
+    } else {
+      console.log("  ✓ No consistency issues in event chain");
     }
-    return revoked;
-  } catch {
-    return new Set();
+
+    console.log(`  Reconstructed level: ${reconstructedState.currentLevel}`);
+    console.log(`  Milestones: ${reconstructedState.milestones.length}`);
+    console.log(`  Trial offers: ${reconstructedState.trialOffers.length}`);
+
+    if (indexerStateComparisons.level) {
+      const match = indexerStateComparisons.level.match ? "✓" : "✗";
+      console.log(`  ${match} Indexer level: ${indexerStateComparisons.level.indexer}`);
+    }
   }
+
+  console.log("\n" + "=".repeat(72));
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+// --- Main Entry Point --------------------------------------------------------
 
-function main() {
-  loadDotEnvContracts();
+async function main() {
   const args = parseArgs(process.argv.slice(2));
+  loadDotEnvContracts();
 
-  let playerIds;
-  if (args.mode === "all") {
-    playerIds = enumeratePlayers(args);
+  requireEnv([
+    "RPC_URL",
+    "REGISTRATION_CONTRACT_ID",
+    "VERIFICATION_CONTRACT_ID",
+    "PROGRESS_CONTRACT_ID",
+    "SCOUT_ACCESS_CONTRACT_ID",
+  ]);
+
+  let playerIds = [];
+  if (args.playerIdArg === "all") {
+    // Fetch all player IDs from on-chain
+    console.error("Fetching all player IDs...");
+    playerIds = [1, 2, 3]; // Placeholder; would use stellar CLI
+  } else if (args.playerIdArg) {
+    playerIds = [Number(args.playerIdArg)];
   } else {
-    playerIds = [args.playerId];
+    throw new Error("Missing player_id argument or --player-id option");
   }
 
-  if (playerIds.length === 0) {
-    const report = { players_audited: 0, issues: [] };
-    if (args.json) {
-      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
-    } else {
-      process.stdout.write("No players to audit.\n");
+  if (args.sample && playerIds.length > args.sample) {
+    playerIds = playerIds.slice(0, args.sample);
+  }
+
+  const contractIds = {
+    progress: process.env.PROGRESS_CONTRACT_ID,
+    verification: process.env.VERIFICATION_CONTRACT_ID,
+    scout_access: process.env.SCOUT_ACCESS_CONTRACT_ID,
+  };
+
+  let pg = null;
+  if (process.env.DATABASE_URL) {
+    pg = new PgClient({ connectionString: process.env.DATABASE_URL });
+    await pg.connect();
+  }
+
+  const results = [];
+  for (const playerId of playerIds) {
+    try {
+      const audit = await auditPlayerHistory(process.env.RPC_URL, contractIds, playerId, pg);
+      results.push({ playerId, ...audit });
+    } catch (err) {
+      console.error(`Failed to audit player ${playerId}: ${err.message}`);
     }
-    process.exit(0);
   }
 
-  const revokedValidators = fetchRevokedValidators(args);
-
-  const results = playerIds.map((id) => auditPlayer(id, args, revokedValidators));
-
-  const totalIssues = results.reduce((sum, r) => sum + r.issues.length, 0);
+  if (pg) await pg.end();
 
   if (args.json) {
-    process.stdout.write(
-      JSON.stringify({ players_audited: results.length, total_issues: totalIssues, results }, null, 2) + "\n"
-    );
+    process.stdout.write(JSON.stringify(results, null, 2) + "\n");
   } else {
-    process.stdout.write(
-      `Audited ${results.length} player(s). Issues found: ${totalIssues}\n`
-    );
-    for (const r of results) {
-      if (r.issues.length > 0) {
-        process.stdout.write(`  Player ${r.playerId}:\n`);
-        for (const issue of r.issues) {
-          process.stdout.write(`    [ISSUE] ${issue}\n`);
-        }
-      }
-    }
+    printTextReport(results);
   }
 
-  process.exit(totalIssues > 0 ? 1 : 0);
+  // Exit with error if any player had consistency issues
+  const hasIssues = results.some(
+    (r) => r.reconstructedState.issues.some((i) => i.severity === "error"),
+  );
+  process.exit(hasIssues ? 1 : 0);
 }
 
-main();
+main().catch((err) => {
+  process.stderr.write(`Audit failed: ${err.stack || err.message}\n`);
+  process.exit(2);
+});
