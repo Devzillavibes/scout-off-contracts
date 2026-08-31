@@ -186,6 +186,7 @@ impl VerificationContract {
     // -------------------------------------------------------------------------
 
     pub fn initialize(env: Env, admin: Address) -> Result<(), VerificationError> {
+        Self::bump_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(VerificationError::AlreadyInitialized);
         }
@@ -653,6 +654,7 @@ impl VerificationContract {
     /// platform's 100-validator cap; the per-validator records remain the
     /// source of truth for detailed queries.
     pub fn get_validators(env: Env) -> Vec<Address> {
+        Self::bump_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::ValidatorVector)
