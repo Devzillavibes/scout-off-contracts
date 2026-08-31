@@ -238,6 +238,14 @@ pub fn reset_player_level(
 pub fn get_level(env: Env, player_id: u64) -> ProgressLevel
 pub fn get_history_count(env: Env, player_id: u64) -> u32
 pub fn get_progress_history(env: Env, player_id: u64) -> Vec<ProgressEntry>
+pub fn get_progress_history_page(env: Env, player_id: u64, offset: u32, limit: u32) -> Vec<ProgressEntry>
+pub fn get_history_page_with_cursor(
+    env: Env,
+    player_id: u64,
+    cursor_snapshot: Option<u32>,
+    cursor_next_index: Option<u32>,
+    limit: u32,
+) -> (Vec<ProgressEntry>, u32, u32)
 pub fn get_history_since(env: Env, player_id: u64, since_timestamp: u64) -> Vec<ProgressEntry>
 pub fn health(env: Env) -> ContractHealth
 pub fn version(env: Env) -> String

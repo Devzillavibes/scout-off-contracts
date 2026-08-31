@@ -151,16 +151,24 @@ Each tier controls which player progress levels a scout can view and what action
 ### Admin Functions
 
 - `initialize(admin, platform_token, fee_config)` — One-time contract setup
-- `update_fee_config(fee_config)` — Adjust subscription and contact fee rates (admin only)
+- `update_fee_config(fee_config)` — Adjust subscription and contact fee rates immediately, no delay (admin only)
+- `propose_fee_config(fee_config)` / `activate_fee_config()` — Propose a new fee configuration; increases require a 7-day timelock before `activate_fee_config` takes effect, while pure decreases activate immediately (admin only)
 - `withdraw_fees(to)` — Withdraw accumulated platform fees (admin only)
 - `pause_contract()` / `unpause_contract()` — Emergency circuit breaker (admin only)
 - `propose_admin(new_admin)` / `accept_admin()` — Rotate each contract's admin after the new address proves control
+- `verify_scout(scout_id)` — Mark a scout profile as verified, gating Sybil-resistant discovery (admin only)
+- `set_diversity_config(required_distinct_affiliations, starting_milestone_index)` / `get_diversity_config()` — Configure (or read) the minimum distinct validator-affiliation count required before a milestone counts toward level advancement (admin only to set)
+- `set_min_region_quorum(min_regions)` — Set the minimum number of distinct validator regions required before Level-2/Level-3 advancement (admin only)
+- `set_milestone_threshold(threshold)` — Set the k-of-n distinct-validator threshold required to commit an attested milestone claim (admin only)
+- `set_voting_window_secs(window_secs)` — Set how long an attestation claim stays open for k-of-n voting before it expires (admin only)
 
 ### Query Functions
 
 - `get_player(player_id)` — Full player profile with progress level and IPFS links
-- `get_progress_history(player_id)` — Tamper-proof timeline of milestone approvals
-- `filter_players(region, position, min_level)` — Scout discovery query
+- `get_progress_history(player_id)` — Tamper-proof timeline of milestone approvals, returned in full. For players with very long histories, use the paginated getters below instead.
+- `get_progress_history_page(player_id, offset, limit)` — Offset-based paginated history, `limit` capped at 50 entries per page
+- `get_history_page_with_cursor(player_id, cursor_snapshot, cursor_next_index, limit)` — Cursor-based paginated history that snapshots the entry count on the first call, so pages stay consistent even if `advance_level` is called concurrently; `limit` capped at 50 entries per page
+- `filter_players(region, position, min_level, offset, limit)` — Paginated scout discovery query; returns a `FilterResult` with a `profiles` page and a `next_cursor` (pass it back as `offset` to continue, `0` means no more results)
 - `get_validators()` — Active validator registry
 - `health()` — On-chain health check
 
@@ -641,6 +649,10 @@ Each contract defines its own error enum. The same numeric code can mean differe
 | 12 | `ScoutNotFound` | Invalid `scout_id` | Verify the `scout_id` from the registration transaction |
 | 13 | `InvalidInput` | Field too long, bad hash count, or empty value | Check field length limits in the function docs |
 | 14 | `PendingAdminNotSet` | `accept_admin` called without a proposal | Call `propose_admin` first |
+| 15 | `PlayerCapReached` | Player registration cap reached | Hard stop; no retry — the platform is full |
+| 16 | `RegistrationCooldown` | Caller attempted to register again before the cooldown period elapsed | Wait for the cooldown window to pass, then retry |
+| 17 | `PlayerRecordEvicted` | `restore_player_record` targeted a player entry whose archival grace period has fully elapsed | Unrecoverable; the record was evicted, not merely archived |
+| 18 | `ScoutRecordEvicted` | `restore_scout_record` targeted a scout entry that has been fully evicted | Unrecoverable; the record was evicted, not merely archived |
 
 ### `VerificationError` (verification contract)
 
@@ -663,8 +675,32 @@ Each contract defines its own error enum. The same numeric code can mean differe
 | 15 | `ValidatorCapReached` | 100-validator platform limit reached | Contract upgrade required to raise the cap; contact admin |
 | 16 | `DuplicateEvidence` | Evidence hash already used in a prior `approve_milestone` call | Use a unique evidence CID for each milestone approval |
 | 17 | `MilestoneLimitExceeded` | Validator has already approved 5 milestones for this player | A different validator must approve further milestones for this player |
+| 18 | `DisputeAlreadyResolved` | Dispute was already resolved and cannot be resolved again | No action; the dispute's outcome is final |
+| 19 | `PendingAdminNotSet` | `accept_admin` called before an admin transfer was proposed | Call `propose_admin` first |
 | 20 | `ApproveMilestonePaused` | `approve_milestone` is paused independently of the whole-contract pause | Wait for admin to unpause the function |
 | 21 | `SpecializationMismatch` | `milestone_category` provided but the validator is not tagged for that category | Use a validator whose `specializations` includes the required category, or omit the category |
+| 22 | `InvalidAttestation` | The ed25519 signature over the attestation payload failed verification, or its contract/network binding does not match this instance | Re-sign the payload with the registered attestation key for the correct contract and network |
+| 23 | `AttestationKeyNotFound` | No attestation public key has been registered for this validator | Call `register_attestation_key` first |
+| 24 | `InvalidNonce` | Attestation nonce is not strictly greater than the last accepted nonce | Query `get_attestation_nonce` and resubmit with a higher nonce |
+| 25 | `RegistrationCooldown` | Validator registration attempted before the cooldown window elapsed | Wait for the cooldown window to pass, then retry |
+| 26 | `DuplicateAttestation` | The same active validator has already attested to this exact `(player_id, evidence_hash)` claim in its current voting round | Wait for the round to resolve, or use a different validator |
+| 27 | `TooManyPendingVotes` | This validator already has the maximum concurrent open (sub-threshold, unexpired) attestation votes outstanding | Wait for one of the validator's pending votes to resolve (commit or expire) before opening another |
+| 28 | `ThresholdModeRequiresAttestation` | `approve_milestone` or `submit_attested_milestone` was called while `get_milestone_threshold() > 1` | Use `attest_milestone` — k-of-n mode has no single-signature bypass once the threshold is `>= 2` |
+| 29 | `RegistrationCallFailed` | Cross-contract call to the registration contract failed | Verify the registration contract is deployed and wired |
+| 30 | `MigrationNotActive` | Migration window is not currently active on this contract | Admin must call `open_migration_window` before seeding state |
+| 31 | `MilestoneAlreadyExists` | A `Milestone` already exists at `(player_id, milestone_index)` with different content | Identical replays are no-ops; a conflicting replay must target a different index |
+| 32 | `DisputeAlreadyExists` | A `MilestoneDispute` already exists at `(player_id, milestone_index)` with different content | Identical replays are no-ops; a conflicting replay must target a different index |
+| 33 | `ValidatorRecordEvicted` | `restore_validator_record` targeted a validator entry whose archival grace period has fully elapsed | Unrecoverable; the record was evicted, not merely marked inactive |
+| 34 | `MilestoneRecordEvicted` | `restore_milestone_record` targeted a milestone entry that has been fully evicted | Unrecoverable |
+| 35 | `NotEligibleToReReview` | `rereview_milestone` called by a wallet that is not a currently-active validator (**not** 32/33 — see notes on issue #1197) | Only active, non-revoked validators may clear a pending re-review flag |
+| 36 | `MilestoneNotFlagged` | `rereview_milestone` called on a milestone that is not currently flagged as pending re-review (**not** 32/33 — see notes on issue #1197) | No action; the flag either never existed or was already cleared by a prior call |
+| 37 | `DisputeRequiresJury` | `resolve_dispute` called on a dispute that requires jury resolution | Use `tally_dispute` to finalize jury-required disputes |
+| 38 | `NotJuryDispute` | `cast_dispute_vote` or `tally_dispute` called on a dispute not routed to the jury path | Use `resolve_dispute` for non-jury disputes |
+| 39 | `VotingWindowClosed` | `cast_dispute_vote` called after the voting window has closed | The dispute must now be finalized via `tally_dispute` |
+| 40 | `ConflictOfInterest` | `cast_dispute_vote` called by the validator who originally approved the disputed milestone | That validator cannot vote on this dispute; a different juror must vote |
+| 41 | `AlreadyVoted` | `cast_dispute_vote` called by a validator who has already voted on this dispute | No action; one vote per validator per dispute |
+| 42 | `VotingWindowOpen` | `tally_dispute` called before the voting window closes, with the vote count tied at or above quorum | Wait for the voting window to close before tallying a tied vote |
+| 43 | `QuorumNotReached` | `tally_dispute` called before the voting window closes and the required quorum of votes has not yet been reached | Wait for more votes or for the voting window to close |
 
 ### `ProgressError` (progress contract)
 
