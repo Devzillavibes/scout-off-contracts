@@ -85,6 +85,26 @@ window the confirmation path refunds the scout's escrow and emits
 
 ---
 
+## Merkle History Commitment
+
+An RFC 6962-style binary Merkle tree maintained by the `progress` contract over every `ProgressEntry` ever written for a player. The tree root (`get_progress_root`) is stored on-chain and advances each time `advance_level` appends a new entry. Because the root is committed on-chain, any caller can verify that a specific history entry is included in the tree **without trusting the RPC node**: fetch the entry and its sibling path via `get_history_proof`, then call `verify_history_proof` on-chain, which recomputes the path and compares the result against the stored root.
+
+This is the mechanism behind the README's "Tamper-Proof History — independently verifiable, not just asserted" claim.
+
+Key types and functions:
+
+| Symbol | Role |
+|---|---|
+| `get_progress_root(player_id)` | Returns the current Merkle root for a player's history |
+| `get_history_proof(player_id, index)` | Returns the `HistoryProofStep` sibling path for a specific entry |
+| `verify_history_proof(player_id, index, proof)` | On-chain verifier — returns `true` if the proof is valid against the stored root |
+| `HistoryProofStep` | A single sibling node in the proof path (hash + left/right position) |
+
+- See [CONTRACT_REFERENCE.md#merkle-history-commitment](CONTRACT_REFERENCE.md#merkle-history-commitment) for the full function signatures.
+- Related entry: [Progress Level](#progress-level).
+
+---
+
 ## Milestone
 
 A verified player achievement recorded on-chain by an authorised validator.
