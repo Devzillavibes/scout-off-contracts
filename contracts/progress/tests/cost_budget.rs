@@ -15,20 +15,22 @@
 //! is intentionally left unset), so the measured cost reflects the progress
 //! contract's own work only, not the cross-contract sync path — that path is
 //! covered by the dedicated registration<->progress integration test instead.
+//!
+//! `advance_level` and `reset_player_level` both cover the Merkle commitment
+//! cost added by issue #700 — recomputing the RFC 6962 Merkle Tree Hash over
+//! the player's (already-materialized) history on every append. Budgets were
+//! calibrated from real CI measurements with 20% headroom (see
+//! `cpu-cost-budget-report.txt`).
 
 use scoutchain_progress::{ProgressContract, ProgressContractClient};
 use scoutchain_shared_types::ProgressLevel;
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
-// These starting budgets are deliberately generous placeholders, not
-// measured baselines: this environment could not run `cargo test` to
-// capture real current costs when this file was first introduced (no Rust
-// toolchain available). Tighten each budget to roughly
-// current-cost-plus-headroom after the first real CI run reports actual
-// numbers — that tightening is a follow-up, not a blocker.
-const ADVANCE_LEVEL_CPU_BUDGET: u64 = 15_000_000;
-const RESET_PLAYER_LEVEL_CPU_BUDGET: u64 = 12_000_000;
-const GET_PROGRESS_HISTORY_PAGE_CPU_BUDGET: u64 = 10_000_000;
+const ADVANCE_LEVEL_CPU_BUDGET: u64 = 484_502;
+const RESET_PLAYER_LEVEL_CPU_BUDGET: u64 = 639_231;
+const GET_PROGRESS_HISTORY_PAGE_CPU_BUDGET: u64 = 195_802;
+const LONG_HISTORY_ADVANCE_LEVEL_CPU_BUDGET: u64 = 30_000_000;
+const VERIFY_HISTORY_PROOF_CPU_BUDGET: u64 = 139_669;
 
 fn setup() -> (Env, ProgressContractClient<'static>, Address) {
     let env = Env::default();
@@ -89,5 +91,45 @@ fn cost_get_progress_history_page() {
         &env,
         "get_progress_history_page",
         GET_PROGRESS_HISTORY_PAGE_CPU_BUDGET,
+    );
+}
+
+#[test]
+fn cost_advance_level_stays_bounded_even_with_long_history() {
+    let (env, client, verification) = setup();
+    let player_id = 42u64;
+
+    for i in 1..=24u32 {
+        client.advance_level(&verification, &player_id, &i);
+        if i % 3 == 0 {
+            client.reset_player_level(&player_id, &ProgressLevel::Unverified);
+        }
+    }
+
+    env.cost_estimate().budget().reset_default();
+    client.advance_level(&verification, &player_id, &99u32);
+    assert_cpu_budget(
+        &env,
+        "advance_level_long_history",
+        LONG_HISTORY_ADVANCE_LEVEL_CPU_BUDGET,
+    );
+}
+
+#[test]
+fn cost_verify_history_proof() {
+    let (env, client, verification) = setup();
+    client.advance_level(&verification, &1u64, &1u32);
+    client.advance_level(&verification, &1u64, &2u32);
+    client.advance_level(&verification, &1u64, &3u32);
+
+    let entry = client.get_history_entry(&1u64, &2u32);
+    let proof = client.get_history_proof(&1u64, &2u32);
+
+    env.cost_estimate().budget().reset_default();
+    client.verify_history_proof(&1u64, &entry, &proof);
+    assert_cpu_budget(
+        &env,
+        "verify_history_proof",
+        VERIFY_HISTORY_PROOF_CPU_BUDGET,
     );
 }

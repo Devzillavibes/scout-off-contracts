@@ -2,13 +2,22 @@
 mod errors;
 mod events;
 mod types;
-use errors::ScoutAccessError;
-use types::{ContactRecord, DataKey, FeeConfigProposal, ProContactPeriod, Subscription, TrialEscrow, TrialOffer};
-pub use types::{FeeConfig, SubscriptionTier};
+
+use types::{FeeConfigProposal, ProContactPeriod, ScoutAccessWiringState};
+
+pub use errors::ScoutAccessError;
+pub use types::{
+    ContactRecord, DataKey, EvidenceAccessGrant, FeeConfig, FeeConfigHistoryEntry, ScoutContactsPage,
+    Subscription, SubscriptionTier, TrialEscrow, TrialOffer,
+};
 
 use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 
-use scoutchain_shared_types::{require_admin, validate_cid, safe_math::{safe_add_u32, safe_add_u64, safe_add_i128, safe_mul_i128}, ContractHealth};
+use scoutchain_shared_types::{
+    read_wiring_link, require_admin,
+    safe_math::{safe_add_i128, safe_add_u32, safe_add_u64, safe_mul_i128},
+    validate_cid, write_wiring_link, ContractHealth,
+};
 
 // Generated client for cross-contract calls to the progress contract.
 // The #[contractclient] macro generates a real Client that performs the
@@ -71,10 +80,7 @@ mod registration_contract {
     #[contractclient(name = "Client")]
     #[allow(dead_code)]
     pub trait RegistrationContractClient {
-        fn get_scout_by_wallet(
-            env: Env,
-            wallet: Address,
-        ) -> Result<ScoutProfile, Error>;
+        fn get_scout_by_wallet(env: Env, wallet: Address) -> Result<ScoutProfile, Error>;
     }
 }
 
@@ -124,7 +130,18 @@ const FEE_CONFIG_PROPOSAL_DELAY_SECS: u64 = 7 * 24 * 60 * 60; // 604,800 seconds
 // immediate past plus the pending proposal window (7 days), while keeping the
 // storage footprint fixed and predictable regardless of how many times fees
 // are updated over the contract's lifetime.
-const FEE_CONFIG_HISTORY_CAP: usize = 5;
+const FEE_CONFIG_HISTORY_CAP: u32 = 5;
+
+// #1040: EvidenceAccessGrant enumeration is paged in fixed-size shards keyed
+// by (player_id, page_index) rather than one growing Vec per player, so a
+// popular player who has accumulated thousands of grants over time doesn't
+// make `get_player_access_grants` (or the write path that appends to it)
+// cost proportional to their total history. `MAX_ACCESS_GRANT_PAGE_LIMIT`
+// caps `get_player_access_grants`'s `limit` argument at exactly one page, so
+// a single call touches at most two pages (the tail of one, the head of the
+// next) regardless of `offset` or total grant count. See ci/cpu-cost-budget.md.
+const ACCESS_GRANT_PAGE_SIZE: u32 = 50;
+const MAX_ACCESS_GRANT_PAGE_LIMIT: u32 = 50;
 
 #[contract]
 pub struct ScoutAccessContract;
@@ -213,6 +230,11 @@ impl ScoutAccessContract {
             .set(&DataKey::FeeConfig, &fee_config);
 
         events::fee_config_updated(&env, &admin, &old_config, &fee_config);
+        // `update_fee_config` is the atomic, immediate, no-delay path — flag it
+        // as such so indexers/auditors can distinguish it from a delay-respecting
+        // `activate_fee_config` call, both of which otherwise emit an identical
+        // `fee_config_updated` event. See docs/FEE_CONFIG_PROPOSAL_DESIGN.md.
+        events::fee_config_delay_bypassed(&env, &admin, &old_config, &fee_config);
         Ok(())
     }
 
@@ -225,11 +247,7 @@ impl ScoutAccessContract {
         Self::validate_fee_config(&fee_config)?;
 
         // Check if a pending proposal already exists
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::PendingFeeConfig)
-        {
+        if env.storage().persistent().has(&DataKey::PendingFeeConfig) {
             return Err(ScoutAccessError::PendingFeeConfigAlreadyExists);
         }
 
@@ -237,7 +255,8 @@ impl ScoutAccessContract {
         let now = env.ledger().timestamp();
 
         // Check if this is a pure decrease (all fees lower or equal)
-        let is_decrease_or_no_change = fee_config.contact_fee_stroops <= current_config.contact_fee_stroops
+        let is_decrease_or_no_change = fee_config.contact_fee_stroops
+            <= current_config.contact_fee_stroops
             && fee_config.basic_sub_stroops <= current_config.basic_sub_stroops
             && fee_config.pro_sub_stroops <= current_config.pro_sub_stroops
             && fee_config.elite_sub_stroops <= current_config.elite_sub_stroops;
@@ -320,12 +339,24 @@ impl ScoutAccessContract {
         if fees == 0 {
             return Err(ScoutAccessError::NoFeesToWithdraw);
         }
+        
+        // ISSUE #1138: Ensure withdraw_fees does not reduce balance below EscrowedTotal
         let xlm = Self::get_token(&env)?;
         let contract_addr = env.current_contract_address();
-        token::Client::new(&env, &xlm).transfer(&contract_addr, &to, &fees);
-        env.storage().instance().set(&key, &0i128);
-        events::fees_withdrawn(&env, &admin, &to, fees);
-        Ok(fees)
+        let balance = token::Client::new(&env, &xlm).balance(&contract_addr);
+        let escrow_total_key = DataKey::EscrowedTotal;
+        let escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+        let available = balance.saturating_sub(escrowed);
+        let withdrawable = fees.min(available);
+        
+        if withdrawable <= 0 {
+            return Err(ScoutAccessError::NoFeesToWithdraw);
+        }
+        
+        token::Client::new(&env, &xlm).transfer(&contract_addr, &to, &withdrawable);
+        env.storage().instance().set(&key, &(fees - withdrawable));
+        events::fees_withdrawn(&env, &admin, &to, withdrawable);
+        Ok(withdrawable)
     }
 
     pub fn pause_contract(env: Env) -> Result<(), ScoutAccessError> {
@@ -354,6 +385,45 @@ impl ScoutAccessContract {
         Ok(())
     }
 
+    /// Pause the `pay_to_contact` function independently (function-scoped circuit
+    /// breaker), mirroring `verification.pause_approve_milestone`. The
+    /// whole-contract pause still takes precedence; this enables granular control
+    /// when only fee-charging contact needs to be halted (e.g. a suspected
+    /// fee-calculation bug or a griefing attack) without blocking scouts from
+    /// reading their subscription status or `subscribe`/trial-offer flows.
+    /// All other functions remain operational. Admin only. (issue #1056)
+    pub fn pause_pay_to_contact(env: Env) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(ScoutAccessError::NotInitialized)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedPayToContact, &true);
+        events::pay_to_contact_paused(&env, &admin);
+        Ok(())
+    }
+
+    /// Unpause the `pay_to_contact` function (function-scoped circuit breaker).
+    /// Admin only. (issue #1056)
+    pub fn unpause_pay_to_contact(env: Env) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(ScoutAccessError::NotInitialized)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedPayToContact, &false);
+        events::pay_to_contact_unpaused(&env, &admin);
+        Ok(())
+    }
+
     /// Register the progress contract address so log_trial_offer can
     /// atomically advance the player to Level 3 (admin only).
     ///
@@ -363,10 +433,14 @@ impl ScoutAccessContract {
     pub fn set_progress_contract(env: Env, addr: Address) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::ProgressContract, &addr);
+        let epoch = write_wiring_link(
+            &env,
+            &DataKey::ProgressContract,
+            &DataKey::ProgressContractEpoch,
+            &addr,
+        );
         events::progress_contract_updated(&env, &admin, &addr);
+        events::wiring_updated(&env, &admin, "progress_contract", &addr, epoch);
         Ok(())
     }
 
@@ -377,16 +451,51 @@ impl ScoutAccessContract {
         Self::set_progress_contract(env, addr)
     }
 
+    /// Return the configured progress contract address, or `None` if the
+    /// link has not been configured. Read-only and requires no auth.
+    pub fn get_progress_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ProgressContract)
+    }
+
     /// Wire the registration contract address for Pro-tier scout verification gating.
     /// Admin only. Can be re-invoked to re-wire the link.
     pub fn set_registration_contract(env: Env, addr: Address) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::RegistrationContract, &addr);
+        let epoch = write_wiring_link(
+            &env,
+            &DataKey::RegistrationContract,
+            &DataKey::RegistrationContractEpoch,
+            &addr,
+        );
         events::registration_contract_updated(&env, &admin, &addr);
+        events::wiring_updated(&env, &admin, "registration_contract", &addr, epoch);
         Ok(())
+    }
+
+    /// Returns a snapshot of both cross-contract peer address pointers held
+    /// by this contract (progress, registration), each with its address and
+    /// re-wiring epoch.
+    ///
+    /// This is a **read-only** function — it does not require auth, does not
+    /// modify state, and is intentionally exempt from the pause/init guards
+    /// so it remains callable even on a mis-wired contract, matching
+    /// `progress.get_wiring_state()`. See `docs/WIRING_REGISTRY_DESIGN.md`.
+    pub fn get_wiring_state(env: Env) -> ScoutAccessWiringState {
+        let progress_contract = read_wiring_link(
+            &env,
+            &DataKey::ProgressContract,
+            &DataKey::ProgressContractEpoch,
+        );
+        let registration_contract = read_wiring_link(
+            &env,
+            &DataKey::RegistrationContract,
+            &DataKey::RegistrationContractEpoch,
+        );
+        ScoutAccessWiringState {
+            progress_contract,
+            registration_contract,
+        }
     }
 
     /// Emergency refund: admin returns `amount` XLM (stroops) from the
@@ -487,15 +596,19 @@ impl ScoutAccessContract {
         // Sybil resistance: gate Pro-tier subscriptions to verified scouts only.
         // Basic and Elite tiers remain unrestricted.
         if tier == SubscriptionTier::Pro {
-            if let Ok(reg_contract_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::RegistrationContract) {
+            if let Some(reg_contract_addr) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::RegistrationContract)
+            {
                 let reg_client = registration_contract::Client::new(&env, &reg_contract_addr);
                 match reg_client.try_get_scout_by_wallet(&scout) {
-                    Ok(scout_profile) => {
+                    Ok(Ok(scout_profile)) => {
                         if !scout_profile.verification.verified {
                             return Err(ScoutAccessError::ScoutNotVerified);
                         }
                     }
-                    Err(_) => {
+                    _ => {
                         // Scout not found in registration contract; deny Pro-tier access
                         return Err(ScoutAccessError::ScoutNotVerified);
                     }
@@ -504,7 +617,7 @@ impl ScoutAccessContract {
             // If registration contract is not wired, allow Pro-tier subscription (graceful degradation)
         }
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         let fee = match &tier {
             SubscriptionTier::Basic => config.basic_sub_stroops,
             SubscriptionTier::Pro => config.pro_sub_stroops,
@@ -513,8 +626,8 @@ impl ScoutAccessContract {
 
         Self::collect_fee(&env, &scout, fee)?;
 
-        let expires_at = safe_add_u64(now, config.sub_duration_secs)
-            .map_err(|_| ScoutAccessError::Overflow)?;
+        let expires_at =
+            safe_add_u64(now, config.sub_duration_secs).map_err(|_| ScoutAccessError::Overflow)?;
 
         let sub = Subscription {
             scout: scout.clone(),
@@ -543,6 +656,9 @@ impl ScoutAccessContract {
             PERSISTENT_TTL_MIN,
             PERSISTENT_TTL_MAX,
         );
+
+        // ISSUE #1139: Add scout to tier index for get_subscribers_by_tier
+        Self::add_to_tier_index(&env, &scout, &tier);
 
         // Add scout to the day-granularity expiry bucket so
         // get_expiring_subscriptions can page through soon-to-expire
@@ -582,11 +698,7 @@ impl ScoutAccessContract {
     /// keeper bot cannot pull funds without a fresh scout signature because
     /// Soroban's token transfer always requires the sender's auth in the
     /// same transaction.  See `renew_if_due` for the auth-model rationale.
-    pub fn set_auto_renew(
-        env: Env,
-        scout: Address,
-        enabled: bool,
-    ) -> Result<(), ScoutAccessError> {
+    pub fn set_auto_renew(env: Env, scout: Address, enabled: bool) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
@@ -690,14 +802,8 @@ impl ScoutAccessContract {
         // Renewal window: last 10 % of the subscription duration, or already
         // expired.  This prevents renewing too early (e.g. the day after
         // subscribing) while still giving the keeper a window before hard expiry.
-        let renewal_window_secs = config
-            .sub_duration_secs
-            .checked_div(10)
-            .unwrap_or(0)
-            .max(1);
-        let renewal_due_at = existing
-            .expires_at
-            .saturating_sub(renewal_window_secs);
+        let renewal_window_secs = config.sub_duration_secs.checked_div(10).unwrap_or(0).max(1);
+        let renewal_due_at = existing.expires_at.saturating_sub(renewal_window_secs);
 
         if now < renewal_due_at {
             // Not yet in the renewal window — no-op, not an error.
@@ -712,7 +818,9 @@ impl ScoutAccessContract {
 
         Self::collect_fee(&env, &scout, fee)?;
 
-        let expires_at = now
+        // Anchor to max(prior expiry, now) so late keeper runs don't drift.
+        let period_start = existing.expires_at.max(now);
+        let expires_at = period_start
             .checked_add(config.sub_duration_secs)
             .ok_or(ScoutAccessError::Overflow)?;
 
@@ -720,7 +828,7 @@ impl ScoutAccessContract {
             scout: scout.clone(),
             tier: existing.tier.clone(),
             expires_at,
-            subscribed_at: now,
+            subscribed_at: period_start,
         };
 
         env.storage()
@@ -732,7 +840,10 @@ impl ScoutAccessContract {
             PERSISTENT_TTL_MAX,
         );
 
-        events::subscription_auto_renewed(&env, &scout, &existing.tier, now, expires_at);
+        // ISSUE #1139: Maintain tier index on renewal
+        Self::add_to_tier_index(&env, &scout, &existing.tier);
+
+        events::subscription_auto_renewed(&env, &scout, &existing.tier, period_start, expires_at);
         // Also emit the legacy scout_subscribed event for backward compatibility.
         events::scout_subscribed(&env, &scout, &existing.tier, fee);
         Ok(())
@@ -742,11 +853,48 @@ impl ScoutAccessContract {
     // Pay-to-contact
     // -------------------------------------------------------------------------
 
+    /// Helper: resolve the effective Pro-tier contact limit for a scout.
+    ///
+    /// If the scout has a registered region (from the registration contract) and
+    /// a per-region override has been set for that region, return the override.
+    /// Otherwise fall back to the platform-wide `FeeConfig.pro_contact_limit`.
+    fn effective_pro_contact_limit(env: &Env, scout: &Address) -> u32 {
+        let config = Self::fee_config(env);
+        let platform_default = config.pro_contact_limit;
+
+        // Attempt to look up the scout's region from the registration contract.
+        let reg_contract_addr = match env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+        {
+            Some(addr) => addr,
+            None => return platform_default,
+        };
+
+        let reg_client = registration_contract::Client::new(env, &reg_contract_addr);
+        let scout_profile = match reg_client.try_get_scout_by_wallet(scout) {
+            Ok(profile) => profile,
+            Err(_) => return platform_default,
+        };
+
+        // Check for a regional override.
+        if let Some(limit) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::RegionalContactLimit(scout_profile.region))
+        {
+            return limit;
+        }
+
+        platform_default
+    }
+
     /// Helper: check Pro tier contact quota with a specific count (batch support).
     fn check_pro_contact_quota_with_count(
         env: &Env,
         scout: &Address,
-        requested: u32,
+        n: u32,
     ) -> Result<(), ScoutAccessError> {
         let sub: Subscription = env
             .storage()
@@ -754,43 +902,107 @@ impl ScoutAccessContract {
             .get(&DataKey::Subscription(scout.clone()))
             .ok_or(ScoutAccessError::ScoutNotSubscribed)?;
 
-        // Only Pro tier has a quota
+        // Only Pro tier has a per-period quota.
         if sub.tier != SubscriptionTier::Pro {
             return Ok(());
         }
 
-        const SECONDS_PER_MONTH: u64 = 2_592_000;
-        let month_bucket = sub.subscribed_at / SECONDS_PER_MONTH;
+        // Use the same subscription-period counter as `pay_to_contact`.
+        // The legacy wall-clock `ContactCount` bucket is retained as an
+        // analytics/indexing mirror, but must not be used for enforcement: a
+        // subscription can begin in a different calendar month from the
+        // previous contact and both entrypoints must share one quota.
+        let period_key = DataKey::ProContactCount(scout.clone());
+        let period: ProContactPeriod =
+            env.storage()
+                .persistent()
+                .get(&period_key)
+                .unwrap_or(ProContactPeriod {
+                    period_start: sub.subscribed_at,
+                    count: 0,
+                });
+        let current = if period.period_start == sub.subscribed_at {
+            period.count
+        } else {
+            0u32
+        };
 
-        let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
-        let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
-
-        let config = Self::fee_config(env);
-        let limit = config.pro_contact_limit;
+        let limit = Self::effective_pro_contact_limit(env, scout);
 
         if current.saturating_add(requested) > limit {
-            return Err(ScoutAccessError::ContactQuotaExceeded);
+            return Err(ScoutAccessError::ProContactLimitReached);
         }
+
+        let new_period = ProContactPeriod {
+            period_start: sub.subscribed_at,
+            count: current_count
+                .checked_add(n)
+                .ok_or(ScoutAccessError::Overflow)?,
+        };
+        env.storage().persistent().set(&period_key, &new_period);
+        env.storage().persistent().extend_ttl(
+            &period_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         Ok(())
     }
 
-    /// Helper: increment contact count for Pro tier scouts.
-    fn increment_contact_count(env: &Env, scout: &Address) {
-        Self::increment_contact_count_by(env, scout, 1)
-    }
+    /// Write an `EvidenceAccessGrant(player_id, scout)` and append `scout` to
+    /// that player's paged enumeration index, atomically with the caller's
+    /// storage writes (both happen inside the same contract invocation, so a
+    /// later error in the caller rolls this back along with everything else).
+    ///
+    /// Called from `pay_to_contact` and `batch_contact_players` — the two
+    /// entrypoints that record a *new* `ContactRecord` — exactly once per
+    /// newly-recorded contact, so a grant is issued if and only if the
+    /// contact fee was actually collected. See `docs/EVIDENCE_PRIVACY.md`.
+    fn grant_evidence_access(
+        env: &Env,
+        player_id: u64,
+        scout: &Address,
+        tier: &SubscriptionTier,
+        granted_at: u64,
+    ) -> Result<(), ScoutAccessError> {
+        let count_key = DataKey::EvidenceAccessGrantCount(player_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
+        let page_idx = count / ACCESS_GRANT_PAGE_SIZE;
 
-    /// Helper: increment contact count by N for Pro tier scouts (batch support).
-    fn increment_contact_count_by(env: &Env, scout: &Address, count: u32) {
-        const SECONDS_PER_MONTH: u64 = 2_592_000;
-        let now = env.ledger().timestamp();
-        let month_bucket = now / SECONDS_PER_MONTH;
-
-        let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
-        let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
+        let page_key = DataKey::EvidenceAccessGrantPage(player_id, page_idx);
+        let mut page: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&page_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        page.push_back(scout.clone());
+        env.storage().persistent().set(&page_key, &page);
         env.storage()
             .persistent()
-            .set(&quota_key, &(current.saturating_add(count)));
+            .extend_ttl(&page_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        let new_count = safe_add_u32(count, 1).map_err(|_| ScoutAccessError::Overflow)?;
+        env.storage().persistent().set(&count_key, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        let grant_key = DataKey::EvidenceAccessGrant(player_id, scout.clone());
+        let grant = EvidenceAccessGrant {
+            player_id,
+            scout: scout.clone(),
+            granted_at,
+            tier_at_grant: tier.clone(),
+            revoked: false,
+            revoked_at: None,
+        };
+        env.storage().persistent().set(&grant_key, &grant);
+        env.storage()
+            .persistent()
+            .extend_ttl(&grant_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        events::evidence_access_granted(env, player_id, scout, tier);
+        Ok(())
     }
 
     /// Pay a micro-fee to unlock a player's contact details.
@@ -810,6 +1022,7 @@ impl ScoutAccessContract {
         Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
+        Self::require_pay_to_contact_not_paused(&env)?;
         scout.require_auth();
 
         let subscription: Subscription = env
@@ -820,11 +1033,6 @@ impl ScoutAccessContract {
         if subscription.expires_at < env.ledger().timestamp() {
             return Err(ScoutAccessError::SubscriptionExpired);
         }
-
-        // Pro-tier quota is enforced below via `ProContactCount`, which resets
-        // on subscription renewal (issue #19). `check_pro_contact_quota` uses
-        // a wall-clock month bucket instead and would reject a call before the
-        // renewal-aware check below gets a chance to run, so it isn't used here.
 
         let contact_key = DataKey::ContactRecord(player_id, scout.clone());
         if env.storage().persistent().has(&contact_key) {
@@ -853,7 +1061,7 @@ impl ScoutAccessContract {
             } else {
                 0u32
             };
-            if current_count >= config.pro_contact_limit {
+            if current_count >= Self::effective_pro_contact_limit(&env, &scout) {
                 return Err(ScoutAccessError::ProContactLimitReached);
             }
             let new_period = ProContactPeriod {
@@ -869,7 +1077,6 @@ impl ScoutAccessContract {
         }
 
         Self::collect_fee(&env, &scout, config.contact_fee_stroops)?;
-        Self::increment_contact_count(&env, &scout);
 
         let record = ContactRecord {
             player_id,
@@ -920,6 +1127,15 @@ impl ScoutAccessContract {
             PERSISTENT_TTL_MAX,
         );
 
+        // #1040: a successful pay_to_contact is the on-chain authorization
+        // event for this scout to request the wrapped decryption key for
+        // player_id's confidential evidence. This runs after every check
+        // above has already passed and the fee has already been collected,
+        // so it is unreachable on any rejected call (see
+        // adversarial_atomicity.rs / atomic_fee_settlement.rs for the
+        // atomicity tests this must satisfy).
+        Self::grant_evidence_access(&env, player_id, &scout, &subscription.tier, record.contacted_at)?;
+
         events::player_contacted(&env, player_id, &scout, config.contact_fee_stroops);
         Ok(())
     }
@@ -941,21 +1157,30 @@ impl ScoutAccessContract {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         scout.require_auth();
-        let _sub = Self::require_active_subscription(&env, &scout)?;
+        let sub = Self::require_active_subscription(&env, &scout)?;
 
         let config = Self::fee_config(&env);
         let mut new_contacts: u32 = 0;
 
         // First pass: count new (uncharged) contacts to compute total fee.
+        // `seen` deduplicates player_ids *within this call* -- storage isn't
+        // mutated until the second pass, so without this a repeated
+        // player_id in the input would be counted (and charged) more than
+        // once even though only a single ContactRecord is ever written.
+        let mut seen: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
         for i in 0..player_ids.len() {
             let player_id = player_ids.get(i).unwrap();
+            if seen.contains(player_id) {
+                continue;
+            }
+            seen.push_back(player_id);
             if !env
                 .storage()
                 .persistent()
                 .has(&DataKey::ContactRecord(player_id, scout.clone()))
             {
-                new_contacts = safe_add_u32(new_contacts, 1)
-                    .map_err(|_| ScoutAccessError::Overflow)?;
+                new_contacts =
+                    safe_add_u32(new_contacts, 1).map_err(|_| ScoutAccessError::Overflow)?;
             }
         }
 
@@ -963,8 +1188,10 @@ impl ScoutAccessContract {
             return Ok(0);
         }
 
-        // Check quota with the count we're about to add
-        Self::check_pro_contact_quota_with_count(&env, &scout, new_contacts)?;
+        // Unified Pro-tier quota: check limit and increment atomically for
+        // the entire batch in one call. Uses the same renewal-aware logic as
+        // pay_to_contact (n=1) via the shared helper.
+        Self::check_and_reserve_pro_quota(&env, &scout, new_contacts)?;
 
         // Single token transfer for all new contacts combined.
         let total_fee = safe_mul_i128(config.contact_fee_stroops, new_contacts as i128)
@@ -1026,10 +1253,47 @@ impl ScoutAccessContract {
                 PERSISTENT_TTL_MAX,
             );
 
+            // #1040: same grant issuance as pay_to_contact, for each new
+            // contact this batch call actually recorded (and charged) — a
+            // scout must not be able to bypass evidence-access grants by
+            // reaching a contact through the batch entrypoint instead.
+            Self::grant_evidence_access(&env, player_id, &scout, &sub.tier, record.contacted_at)?;
+
             events::player_contacted(&env, player_id, &scout, config.contact_fee_stroops);
         }
 
         Self::increment_contact_count_by(&env, &scout, new_contacts);
+
+        // Keep the renewal-aware Pro quota counter in lockstep with the
+        // legacy monthly analytics counter. `pay_to_contact` writes this
+        // counter before charging; batch writes it after the single charge.
+        if sub.tier == SubscriptionTier::Pro {
+            let period_key = DataKey::ProContactCount(scout.clone());
+            let period: ProContactPeriod =
+                env.storage()
+                    .persistent()
+                    .get(&period_key)
+                    .unwrap_or(ProContactPeriod {
+                        period_start: sub.subscribed_at,
+                        count: 0,
+                    });
+            let current = if period.period_start == sub.subscribed_at {
+                period.count
+            } else {
+                0u32
+            };
+            let updated = ProContactPeriod {
+                period_start: sub.subscribed_at,
+                count: safe_add_u32(current, new_contacts)
+                    .map_err(|_| ScoutAccessError::Overflow)?,
+            };
+            env.storage().persistent().set(&period_key, &updated);
+            env.storage().persistent().extend_ttl(
+                &period_key,
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
+            );
+        }
 
         env.storage().persistent().extend_ttl(
             &DataKey::Subscription(scout.clone()),
@@ -1157,11 +1421,17 @@ impl ScoutAccessContract {
         // refund path (confirm_trial_offer's late-expiry branch and
         // expire_trial_offers) paid out funds the contract never held.
         let token_addr = Self::get_token(&env)?;
-        token::Client::new(&env, &token_addr).transfer(
-            &scout,
-            &env.current_contract_address(),
-            &escrow_amount,
-        );
+        let contract_addr = env.current_contract_address();
+        token::Client::new(&env, &token_addr).transfer(&scout, &contract_addr, &escrow_amount);
+
+        // ISSUE #1138: Track escrowed total to segregate escrow-held funds
+        // from withdrawable fees. Prevent withdraw_fees from depleting the
+        // escrow reserve.
+        let escrow_total_key = DataKey::EscrowedTotal;
+        let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+        let new_escrowed = safe_add_i128(current_escrowed, escrow_amount)
+            .map_err(|_| ScoutAccessError::Overflow)?;
+        env.storage().instance().set(&escrow_total_key, &new_escrowed);
 
         let escrow = TrialEscrow {
             amount: escrow_amount,
@@ -1170,6 +1440,18 @@ impl ScoutAccessContract {
         env.storage()
             .persistent()
             .set(&DataKey::TrialEscrow(player_id, next_index), &escrow);
+        // Extend TrialEscrow TTL so the escrow record outlives its own expiry
+        // window. Without this, Soroban assigns the default minimal persistent
+        // TTL (~4,096 ledgers ≈ 5.7 hours), which is shorter than the
+        // configured trial_offer_expiry_secs and could cause the record to
+        // become archived before either confirm_trial_offer or
+        // expire_trial_offers resolves it — locking the escrowed XLM with no
+        // read-accessible path to the two functions that can release it.
+        env.storage().persistent().extend_ttl(
+            &DataKey::TrialEscrow(player_id, next_index),
+            TRIAL_TTL_THRESHOLD,
+            TRIAL_TTL_EXTEND_TO,
+        );
 
         // #795: index this escrow so expire_trial_offers can sweep it later
         // without an off-chain indexer.
@@ -1193,17 +1475,51 @@ impl ScoutAccessContract {
         Ok(next_index)
     }
     /// Confirm a previously logged trial offer. Called by the player (or validator) to release escrow and advance level.
+    ///
+    /// `idempotency_nonce` is an optional caller-supplied token. If provided and
+    /// the nonce has already been processed, the function returns `Ok(())`
+    /// without replaying escrow cleanup or level advancement. This makes
+    /// retries after `ProgressCallFailed` safe.
     pub fn confirm_trial_offer(
         env: Env,
         player_wallet: Address,
         player_id: u64,
         index: u32,
+        idempotency_nonce: Option<String>,
     ) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         // Player must authorize
         player_wallet.require_auth();
+
+        // ISSUE #1136: Cross-contract verify that player_wallet owns player_id
+        // in the registration contract before proceeding with escrow release.
+        // This prevents any wallet from releasing escrow and advancing an
+        // arbitrary player to Level 3.
+        let reg_contract_addr = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+            .ok_or(ScoutAccessError::InvalidInput)?; // Fail closed if registration not wired
+        let reg_client = registration_contract::Client::new(&env, &reg_contract_addr);
+        let player_profile = reg_client
+            .get_player(&player_id)
+            .map_err(|_| ScoutAccessError::Unauthorized)?;
+        if player_profile.owner != player_wallet {
+            return Err(ScoutAccessError::Unauthorized);
+        }
+
+        // ISSUE #1137: Idempotency nonce must be derived from (player_id, index)
+        // to prevent griefers from pre-seeding arbitrary caller-supplied nonces.
+        // The nonce key now binds to the specific trial offer rather than an
+        // unauthenticated global string.
+        let nonce_key = DataKey::ConfirmationNonce(
+            String::from_str(&env, &format!("trial_confirm:{}:{}", player_id, index))
+        );
+        if env.storage().persistent().has(&nonce_key) {
+            return Ok(());
+        }
 
         // Load escrow record
         let escrow: TrialEscrow = env
@@ -1225,27 +1541,35 @@ impl ScoutAccessContract {
             // Refund escrow to scout
             let token_addr = Self::get_token(&env)?;
             let contract_addr = env.current_contract_address();
+            let balance = token::Client::new(&env, &token_addr).balance(&contract_addr);
+            if escrow.amount > balance {
+                return Err(ScoutAccessError::InsufficientFee);
+            }
             token::Client::new(&env, &token_addr).transfer(
                 &contract_addr,
                 &offer.scout,
                 &escrow.amount,
             );
+            // ISSUE #1138: Decrement escrowed total on refund
+            let escrow_total_key = DataKey::EscrowedTotal;
+            let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+            let new_escrowed = current_escrowed.saturating_sub(escrow.amount);
+            env.storage().instance().set(&escrow_total_key, &new_escrowed);
             // Cleanup escrow
             env.storage()
                 .persistent()
                 .remove(&DataKey::TrialEscrow(player_id, index));
             Self::remove_from_outstanding_trial_escrows(&env, player_id, index);
-            // Emit expiry event
+            // Emit expiry event. Returning `Ok(())` is intentional: Soroban
+            // rolls back all state changes when a contract returns `Err`, so
+            // returning `TrialOfferExpired` here would undo the refund and
+            // escrow cleanup. The event is the durable outcome signal.
             events::trial_offer_expired(&env, player_id, &offer.scout, index);
-            return Err(ScoutAccessError::TrialOfferExpired);
+            return Ok(());
         }
 
-        // Maintain bounded enumeration index for sweep operations.
-        Self::trial_escrow_index_insert(&env, player_id, next_index);
-
         // Cross-contract call: advance the player to Level 3 if progress contract is set.
-        if let Some(progress_addr) = env
-        // Call progress contract to advance level (using the index as milestone reference)
+        // Call progress contract to advance level (using the index as milestone reference).
         let progress_addr = match env
             .storage()
             .instance()
@@ -1274,6 +1598,21 @@ impl ScoutAccessContract {
             }
         }
 
+        // Persist idempotency nonce after successful level advancement so that
+        // a retry can safely detect the offer was already confirmed.
+        env.storage().persistent().set(&nonce_key, &());
+        env.storage().persistent().extend_ttl(
+            &nonce_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
+        // ISSUE #1138: Decrement escrowed total on successful confirmation
+        let escrow_total_key = DataKey::EscrowedTotal;
+        let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+        let new_escrowed = current_escrowed.saturating_sub(escrow.amount);
+        env.storage().instance().set(&escrow_total_key, &new_escrowed);
+
         // Cleanup escrow after successful confirmation
         env.storage()
             .persistent()
@@ -1284,29 +1623,6 @@ impl ScoutAccessContract {
         Ok(())
     }
 
-    /// Confirm a trial offer (admin-only for now; later may be called by escrow logic).
-    /// Removes the offer from the bounded enumeration index so it no longer appears
-    /// in sweep iterations.
-    pub fn confirm_trial_offer(env: Env, player_id: u64, trial_index: u32) -> Result<(), ScoutAccessError> {
-        Self::bump_instance_ttl(&env);
-        Self::require_admin(&env)?;
-
-        // Verify the offer exists before removing it from the index.
-        let _offer: TrialOffer = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TrialOffer(player_id, trial_index))
-            .ok_or(ScoutAccessError::InvalidInput)?;
-
-        Self::trial_escrow_index_remove(&env, player_id, trial_index);
-        events::trial_offer_confirmed(&env, player_id, trial_index);
-        Ok(())
-    }
-
-    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), ScoutAccessError> {
-        Self::require_admin(&env)?;
-        let old_admin = Self::get_admin(&env);
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
     /// Admin helper to sweep pending trial offers that have passed their
     /// expiry window: refunds the escrowed XLM to the originating scout,
     /// removes the `TrialEscrow` record, and emits `trial_offer_expired`
@@ -1353,6 +1669,17 @@ impl ScoutAccessContract {
                 None => continue,
             };
             if now <= escrow.expires_at {
+                // Keep-alive: this escrow has not yet expired so it stays in
+                // the outstanding list for a future sweep. Re-extend its TTL
+                // so that a large backlog of live escrows cannot be silently
+                // archived between sweep calls — which would make them
+                // unreadable to both this sweep function and
+                // confirm_trial_offer before the player ever acts on the offer.
+                env.storage().persistent().extend_ttl(
+                    &escrow_key,
+                    TRIAL_TTL_THRESHOLD,
+                    TRIAL_TTL_EXTEND_TO,
+                );
                 kept.push_back((player_id, index));
                 continue;
             }
@@ -1371,7 +1698,21 @@ impl ScoutAccessContract {
                 }
             };
 
+            // ISSUE #1138: Check balance before transferring to prevent running
+            // out of funds for other escrow refunds
+            let balance = token::Client::new(&env, &token_addr).balance(&contract_addr);
+            if escrow.amount > balance {
+                // Keep this escrow for a later sweep when balance is replenished
+                kept.push_back((player_id, index));
+                continue;
+            }
+
             token::Client::new(&env, &token_addr).transfer(&contract_addr, &scout, &escrow.amount);
+            // ISSUE #1138: Decrement escrowed total on sweep
+            let escrow_total_key = DataKey::EscrowedTotal;
+            let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+            let new_escrowed = current_escrowed.saturating_sub(escrow.amount);
+            env.storage().instance().set(&escrow_total_key, &new_escrowed);
             env.storage().persistent().remove(&escrow_key);
             events::trial_offer_expired(&env, player_id, &scout, index);
             swept = safe_add_u32(swept, 1).map_err(|_| ScoutAccessError::Overflow)?;
@@ -1389,6 +1730,58 @@ impl ScoutAccessContract {
             .extend_ttl(&index_key, TRIAL_TTL_THRESHOLD, TRIAL_TTL_EXTEND_TO);
 
         Ok(swept)
+    }
+
+    /// Admin-only rescue valve: directly refund one identified, still
+    /// outstanding `TrialEscrow` entry — e.g. one flagged by a scout
+    /// complaint or surfaced by the indexer's drift-detection — without
+    /// waiting for `expire_trial_offers` to reach it. See
+    /// docs/TRIAL_ESCROW_IMPACT.md, recommendation 2.
+    ///
+    /// Rejects with `TrialEscrowNotOutstanding` if `(player_id, offer_index)`
+    /// has no live `TrialEscrow` entry: already confirmed, already
+    /// expired/refunded, already admin-refunded, or never logged. Because the
+    /// check and the removal target the same record, a retried call after a
+    /// successful refund finds nothing outstanding and safely no-ops into
+    /// that same error instead of transferring a second time.
+    pub fn admin_refund_trial_escrow(
+        env: Env,
+        player_id: u64,
+        offer_index: u32,
+        to: Address,
+    ) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+
+        let escrow_key = DataKey::TrialEscrow(player_id, offer_index);
+        let escrow: TrialEscrow = env
+            .storage()
+            .persistent()
+            .get(&escrow_key)
+            .ok_or(ScoutAccessError::TrialEscrowNotOutstanding)?;
+
+        let token_addr = Self::get_token(&env)?;
+        let contract_addr = env.current_contract_address();
+        let balance = token::Client::new(&env, &token_addr).balance(&contract_addr);
+        if escrow.amount > balance {
+            return Err(ScoutAccessError::InsufficientFee);
+        }
+        token::Client::new(&env, &token_addr).transfer(&contract_addr, &to, &escrow.amount);
+
+        // ISSUE #1138: Decrement escrowed total on admin refund
+        let escrow_total_key = DataKey::EscrowedTotal;
+        let current_escrowed: i128 = env.storage().instance().get(&escrow_total_key).unwrap_or(0i128);
+        let new_escrowed = current_escrowed.saturating_sub(escrow.amount);
+        env.storage().instance().set(&escrow_total_key, &new_escrowed);
+
+        // Same cleanup order as confirm_trial_offer/expire_trial_offers:
+        // drop the primary record, then scrub the enumeration index, so no
+        // later sweep or late confirm can see or act on this entry again.
+        env.storage().persistent().remove(&escrow_key);
+        Self::remove_from_outstanding_trial_escrows(&env, player_id, offer_index);
+
+        events::trial_escrow_admin_refunded(&env, player_id, offer_index, &to, escrow.amount);
+        Ok(())
     }
 
     /// Propose a replacement administrator. The current admin remains active
@@ -1458,6 +1851,33 @@ impl ScoutAccessContract {
         Ok(sub)
     }
 
+    /// Recover an archived (or expired-but-not-evicted) subscription entry by
+    /// re-extending its TTL to the core-identity policy value (518,400 ledgers).
+    ///
+    /// On Soroban protocol 23+, reading an archived entry auto-restores it
+    /// within the archival grace period. This entrypoint makes that recovery
+    /// explicit and operator-driven, then lifts the entry's TTL back to the
+    /// full documented lifetime so it cannot silently age into permanent
+    /// eviction.
+    ///
+    /// Admin-only. Returns `SubscriptionRecordEvicted` if the entry has already
+    /// been fully evicted (key absent) and is unrecoverable.
+    pub fn restore_subscription_record(env: Env, scout: Address) -> Result<(), ScoutAccessError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let _sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Subscription(scout.clone()))
+            .ok_or(ScoutAccessError::SubscriptionRecordEvicted)?;
+        env.storage().persistent().extend_ttl(
+            &DataKey::Subscription(scout.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+        events::subscription_record_restored(&env, &admin, &scout);
+        Ok(())
+    }
+
     pub fn get_fee_config(env: Env) -> FeeConfig {
         Self::bump_instance_ttl(&env);
         Self::fee_config(&env)
@@ -1506,10 +1926,13 @@ impl ScoutAccessContract {
     ///
     /// Uses the day-granularity `ExpiryBucket` index populated by `subscribe` to
     /// avoid a full linear scan of all subscribers.  Only buckets whose day key
-    /// falls within `[0, before_timestamp / 86_400]` are examined.  The index
-    /// covers all days from epoch 0 up to the given cutoff, so the scan is bounded
-    /// by the number of distinct expiry days in that range, not the total number
-    /// of scouts.
+    /// falls within `[start_day, before_timestamp / 86_400]` are examined, where
+    /// `start_day` is the minimum populated bucket day (`DataKey::MinExpiryBucketDay`)
+    /// tracked by `add_to_expiry_bucket`.  Because no bucket is ever populated
+    /// before that day, the scan is bounded by the number of distinct populated
+    /// expiry days in range, not the number of days since epoch — in particular it
+    /// does not waste instructions stepping through the (usually empty) day buckets
+    /// between epoch 0 and the first real subscription.
     ///
     /// **Index tradeoff**: day-bucket granularity is chosen over exact expiry-time
     /// indexing to keep per-`subscribe` storage cost low.  Each bucket entry is
@@ -1537,10 +1960,16 @@ impl ScoutAccessContract {
 
         let mut results: soroban_sdk::Vec<Subscription> = soroban_sdk::Vec::new(&env);
 
-        // Walk day buckets from day 0 up to cutoff_day (inclusive).
-        // In practice, epoch-0 buckets are never populated; the loop starts
-        // effectively at the earliest real subscription day.
-        let mut day = 0u64;
+        // Walk day buckets from the earliest populated bucket day up to
+        // cutoff_day (inclusive). Skipping the (usually empty) day buckets
+        // before MinExpiryBucketDay keeps this O(populated days), not
+        // O(elapsed days since epoch).
+        let start_day: u64 = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::MinExpiryBucketDay)
+            .unwrap_or(0);
+        let mut day = start_day;
         while day <= cutoff_day && results.len() < effective_limit {
             let bucket_key = DataKey::ExpiryBucket(day);
             if let Some(scouts) = env
@@ -1601,6 +2030,9 @@ impl ScoutAccessContract {
     }
 
     /// Return all player_ids contacted by `scout` as an O(1) index lookup.
+    ///
+    /// > **Deprecated**: this legacy method is unbounded.  High-volume callers
+    /// should use [`get_scout_contacts_page`] to keep response sizes bounded.
     pub fn get_scout_contacts(env: Env, scout: Address) -> soroban_sdk::Vec<u64> {
         Self::bump_instance_ttl(&env);
         let key = DataKey::ScoutContacts(scout.clone());
@@ -1615,6 +2047,48 @@ impl ScoutAccessContract {
                 .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
         }
         list
+    }
+
+    /// Return a bounded, paginated page of player IDs contacted by `scout`,
+    /// together with the total number of contacts.
+    ///
+    /// This is the canonical paginated successor to the unbounded
+    /// `get_scout_contacts`.  The `total` field lets callers determine when
+    /// paging is complete without over-fetching.
+    ///
+    /// **Pagination**: `offset` is a zero-based item offset; `limit` is capped
+    /// at 50 entries per page, matching the convention used by
+    /// `get_global_milestone_index` and `get_validator_milestones_page_v2`.
+    ///
+    /// **Ordering**: entries are returned in contact order (oldest first).
+    pub fn get_scout_contacts_page(
+        env: Env,
+        scout: Address,
+        offset: u32,
+        limit: u32,
+    ) -> ScoutContactsPage {
+        Self::bump_instance_ttl(&env);
+        let key = DataKey::ScoutContacts(scout.clone());
+        let list: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if !list.is_empty() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
+        let total = list.len();
+        let cap = limit.min(50);
+        let mut entries: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+        let mut i = offset;
+        while i < total && entries.len() < cap {
+            entries.push_back(list.get(i).unwrap());
+            i += 1;
+        }
+        ScoutContactsPage { entries, total }
     }
 
     /// Return all scout addresses that have contacted `player_id` as an O(1)
@@ -1636,6 +2110,140 @@ impl ScoutAccessContract {
         list
     }
 
+    // -------------------------------------------------------------------------
+    // Evidence access grants (docs/EVIDENCE_PRIVACY.md)
+    // -------------------------------------------------------------------------
+
+    /// True if `scout` currently holds a non-revoked `EvidenceAccessGrant`
+    /// for `player_id`. The off-chain key-wrapping service calls this (or
+    /// `get_evidence_access_grant`) before honoring a key-wrap request.
+    pub fn has_evidence_access(env: Env, player_id: u64, scout: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, EvidenceAccessGrant>(&DataKey::EvidenceAccessGrant(player_id, scout))
+            .map(|g| !g.revoked)
+            .unwrap_or(false)
+    }
+
+    /// Return the full `EvidenceAccessGrant` record for (player_id, scout),
+    /// if one has ever been issued — including a revoked grant, so callers
+    /// can distinguish "never granted" from "granted, then revoked".
+    pub fn get_evidence_access_grant(
+        env: Env,
+        player_id: u64,
+        scout: Address,
+    ) -> Option<EvidenceAccessGrant> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EvidenceAccessGrant(player_id, scout))
+    }
+
+    /// Page through every `EvidenceAccessGrant` ever issued for `player_id`,
+    /// oldest-first, so a player-facing UI can audit who has access to their
+    /// evidence. `limit` is capped at `MAX_ACCESS_GRANT_PAGE_LIMIT` (50) and
+    /// equals `ACCESS_GRANT_PAGE_SIZE`, so a single call reads at most two
+    /// index pages (the tail of one, the head of the next) plus one grant
+    /// record per returned entry — CPU cost bounded by `limit`, independent
+    /// of how many grants `player_id` has accumulated in total (proven at
+    /// 1,000+ grants by `contracts/scout_access/tests/cost_budget.rs`).
+    ///
+    /// Page through a player's full history by advancing `offset` by the
+    /// number of entries returned in the previous page.
+    pub fn get_player_access_grants(
+        env: Env,
+        player_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<EvidenceAccessGrant> {
+        Self::bump_instance_ttl(&env);
+        let mut results: soroban_sdk::Vec<EvidenceAccessGrant> = soroban_sdk::Vec::new(&env);
+
+        let effective_limit = limit.min(MAX_ACCESS_GRANT_PAGE_LIMIT);
+        if effective_limit == 0 {
+            return results;
+        }
+        let end = match offset.checked_add(effective_limit) {
+            Some(e) => e,
+            None => return results,
+        };
+
+        let mut position = offset;
+        while position < end {
+            let page_idx = position / ACCESS_GRANT_PAGE_SIZE;
+            let page: soroban_sdk::Vec<Address> = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::EvidenceAccessGrantPage(player_id, page_idx))
+            {
+                Some(p) => p,
+                // Pages are appended contiguously with no gaps, so a missing
+                // page means the enumeration ends here.
+                None => break,
+            };
+            let mut i = position % ACCESS_GRANT_PAGE_SIZE;
+            if i >= page.len() {
+                break;
+            }
+            while i < page.len() && position < end {
+                let scout = page.get(i).unwrap();
+                if let Some(grant) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, EvidenceAccessGrant>(&DataKey::EvidenceAccessGrant(
+                        player_id,
+                        scout,
+                    ))
+                {
+                    results.push_back(grant);
+                }
+                i = i.saturating_add(1);
+                position = position.saturating_add(1);
+            }
+        }
+
+        results
+    }
+
+    /// Compliance/abuse takedown: mark an `EvidenceAccessGrant` revoked.
+    ///
+    /// This does not delete the grant record — it is an append-only fact
+    /// that this scout *was* authorized at `granted_at`. Revoking only
+    /// instructs the off-chain key-wrapping service to stop honoring
+    /// *future* key-wrap requests for this (player_id, scout) pair; it
+    /// cannot claw back a wrapped key already delivered before the revoke
+    /// (the contract never held the key — see `docs/EVIDENCE_PRIVACY.md`).
+    /// Idempotent: revoking an already-revoked grant is a no-op that
+    /// returns `Ok(())` without re-emitting the event.
+    pub fn admin_revoke_evidence_access(
+        env: Env,
+        player_id: u64,
+        scout: Address,
+    ) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+
+        let grant_key = DataKey::EvidenceAccessGrant(player_id, scout.clone());
+        let mut grant: EvidenceAccessGrant = env
+            .storage()
+            .persistent()
+            .get(&grant_key)
+            .ok_or(ScoutAccessError::GrantNotFound)?;
+
+        if grant.revoked {
+            return Ok(());
+        }
+
+        grant.revoked = true;
+        grant.revoked_at = Some(env.ledger().timestamp());
+        env.storage().persistent().set(&grant_key, &grant);
+        env.storage()
+            .persistent()
+            .extend_ttl(&grant_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        events::evidence_access_revoked(&env, player_id, &scout, &admin);
+        Ok(())
+    }
+
     pub fn get_trial_offer(
         env: Env,
         player_id: u64,
@@ -1653,6 +2261,16 @@ impl ScoutAccessContract {
             TRIAL_TTL_EXTEND_TO,
         );
         Ok(offer)
+    }
+
+    /// Return the escrow record for a pending trial offer, if it exists.
+    /// This read-only getter is used by address-migration tooling to preserve
+    /// in-flight escrow state instead of replaying only the offer metadata.
+    pub fn get_trial_escrow(env: Env, player_id: u64, index: u32) -> Option<TrialEscrow> {
+        Self::bump_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::TrialEscrow(player_id, index))
     }
 
     pub fn get_trial_count(env: Env, player_id: u64) -> u32 {
@@ -1720,6 +2338,401 @@ impl ScoutAccessContract {
         offers
     }
 
+    // -------------------------------------------------------------------------
+    // Migration window management
+    // -------------------------------------------------------------------------
+
+    /// Open the migration window.  Admin-only.
+    ///
+    /// While open, `admin_seed_subscription`, `admin_seed_contact`,
+    /// `admin_seed_trial_offer`, and `admin_seed_auto_renew` may be called to
+    /// replay historical records.  Close immediately after replay.
+    pub fn open_migration_window(env: Env) -> Result<(), ScoutAccessError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationActive, &true);
+        Ok(())
+    }
+
+    /// Close the migration window.  Admin-only.
+    pub fn close_migration_window(env: Env) -> Result<(), ScoutAccessError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationActive, &false);
+        Ok(())
+    }
+
+    /// Returns `true` if the migration window is currently open.
+    pub fn migration_window_is_open(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MigrationActive)
+            .unwrap_or(false)
+    }
+
+    // -------------------------------------------------------------------------
+    // Migration seeding
+    // -------------------------------------------------------------------------
+
+    /// Seed a historical scout `Subscription` from a prior contract deployment.
+    ///
+    /// MIGRATION_GAPS row 8.  Reconstructs:
+    ///
+    /// - `Subscription(scout)` — the subscription record
+    /// - `TierSubscribers(tier)` — tier-indexed subscriber list
+    /// - `ExpiryBucket(bucket)` — day-granularity expiry index
+    ///
+    /// ## Idempotency
+    ///
+    /// Keyed on `scout` address.  Byte-identical replay → no-op.
+    /// Conflicting content → `SubscriptionAlreadyExists`.
+    pub fn admin_seed_subscription(
+        env: Env,
+        subscription: Subscription,
+    ) -> Result<(), ScoutAccessError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_migration_active(&env)?;
+
+        let sub_key = DataKey::Subscription(subscription.scout.clone());
+
+        // ── Idempotency ───────────────────────────────────────────────────────
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Subscription>(&sub_key)
+        {
+            let identical = existing.scout == subscription.scout
+                && existing.tier == subscription.tier
+                && existing.expires_at == subscription.expires_at
+                && existing.subscribed_at == subscription.subscribed_at;
+            if identical {
+                return Ok(());
+            }
+            return Err(ScoutAccessError::SubscriptionAlreadyExists);
+        }
+
+        // ── Write Subscription ────────────────────────────────────────────────
+        env.storage().persistent().set(&sub_key, &subscription);
+        env.storage()
+            .persistent()
+            .extend_ttl(&sub_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        // ── Update TierSubscribers ────────────────────────────────────────────
+        let ts_key = DataKey::TierSubscribers(subscription.tier.clone());
+        let mut tier_subs: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&ts_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tier_subs.iter().any(|a| a == subscription.scout) {
+            tier_subs.push_back(subscription.scout.clone());
+            env.storage().persistent().set(&ts_key, &tier_subs);
+            env.storage()
+                .persistent()
+                .extend_ttl(&ts_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
+        // ── Update ExpiryBucket ───────────────────────────────────────────────
+        let bucket = subscription.expires_at / 86_400;
+        let eb_key = DataKey::ExpiryBucket(bucket);
+        let mut bucket_scouts: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&eb_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !bucket_scouts.iter().any(|a| a == subscription.scout) {
+            bucket_scouts.push_back(subscription.scout.clone());
+            env.storage().persistent().set(&eb_key, &bucket_scouts);
+            env.storage()
+                .persistent()
+                .extend_ttl(&eb_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+        Self::track_min_expiry_bucket_day(&env, bucket);
+
+        Ok(())
+    }
+
+    /// Seed a historical contact record from a prior contract deployment.
+    ///
+    /// MIGRATION_GAPS row 9.  Reconstructs:
+    ///
+    /// - `ContactRecord(player_id, scout)` — full contact record
+    /// - `ScoutContacts(scout)` — per-scout contacted-player list
+    /// - `PlayerContacts(player_id)` — per-player contacting-scout list
+    ///
+    /// ## Idempotency
+    ///
+    /// Keyed on `(player_id, scout)`.  Byte-identical replay → no-op;
+    /// conflicting content → `ContactAlreadyExists`.
+    pub fn admin_seed_contact(env: Env, contact: ContactRecord) -> Result<(), ScoutAccessError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_migration_active(&env)?;
+
+        let cr_key = DataKey::ContactRecord(contact.player_id, contact.scout.clone());
+
+        // ── Idempotency ───────────────────────────────────────────────────────
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ContactRecord>(&cr_key)
+        {
+            let identical = existing.player_id == contact.player_id
+                && existing.scout == contact.scout
+                && existing.contacted_at == contact.contacted_at;
+            if identical {
+                return Ok(());
+            }
+            return Err(ScoutAccessError::ContactAlreadyExists);
+        }
+
+        // ── Write ContactRecord ───────────────────────────────────────────────
+        env.storage().persistent().set(&cr_key, &contact);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cr_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        // ── Update ScoutContacts ──────────────────────────────────────────────
+        let sc_key = DataKey::ScoutContacts(contact.scout.clone());
+        let mut sc: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&sc_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !sc.iter().any(|id| id == contact.player_id) {
+            sc.push_back(contact.player_id);
+            env.storage().persistent().set(&sc_key, &sc);
+            env.storage()
+                .persistent()
+                .extend_ttl(&sc_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
+        // ── Update PlayerContacts ─────────────────────────────────────────────
+        let pc_key = DataKey::PlayerContacts(contact.player_id);
+        let mut pc: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&pc_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !pc.iter().any(|a| a == contact.scout) {
+            pc.push_back(contact.scout.clone());
+            env.storage().persistent().set(&pc_key, &pc);
+            env.storage()
+                .persistent()
+                .extend_ttl(&pc_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
+        Ok(())
+    }
+
+    /// Seed a historical trial offer from a prior contract deployment.
+    ///
+    /// MIGRATION_GAPS row 10.  Reconstructs:
+    ///
+    /// - `TrialOffer(player_id, trial_index)` — the offer record
+    /// - `TrialEscrow(player_id, trial_index)` — escrow record (if provided)
+    /// - `TrialCounter(player_id)` — per-player offer count
+    /// - `ScoutTrialOffers(scout)` — per-scout offers-sent index
+    ///
+    /// `trial_index` is 1-based, matching `log_trial_offer`: the first offer
+    /// a scout logs is index 1 and each subsequent seed must be
+    /// `TrialCounter(player_id) + 1`.  Zero, gaps, or out-of-order indices
+    /// return `TrialOfferNotFound`.
+    ///
+    /// ## Idempotency
+    ///
+    /// Keyed on `(player_id, trial_index)`.  Byte-identical replay → no-op.
+    /// Conflicting content → `TrialOfferAlreadyExists`.
+    pub fn admin_seed_trial_offer(
+        env: Env,
+        player_id: u64,
+        trial_index: u32,
+        offer: TrialOffer,
+        escrow: Option<TrialEscrow>,
+    ) -> Result<(), ScoutAccessError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_migration_active(&env)?;
+
+        let to_key = DataKey::TrialOffer(player_id, trial_index);
+
+        // ── Idempotency ───────────────────────────────────────────────────────
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TrialOffer>(&to_key)
+        {
+            let identical = existing.player_id == offer.player_id
+                && existing.scout == offer.scout
+                && existing.details_hash == offer.details_hash
+                && existing.logged_at == offer.logged_at;
+            if identical {
+                return Ok(());
+            }
+            return Err(ScoutAccessError::TrialOfferAlreadyExists);
+        }
+
+        // ── Index continuity (1-based, matching log_trial_offer) ─────────────
+        let tc_key = DataKey::TrialCounter(player_id);
+        let current_count: u32 = env.storage().persistent().get(&tc_key).unwrap_or(0u32);
+        let expected_index =
+            safe_add_u32(current_count, 1).map_err(|_| ScoutAccessError::Overflow)?;
+        if trial_index != expected_index {
+            return Err(ScoutAccessError::TrialOfferNotFound);
+        }
+
+        // ── Write TrialOffer ──────────────────────────────────────────────────
+        env.storage().persistent().set(&to_key, &offer);
+        env.storage()
+            .persistent()
+            .extend_ttl(&to_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        // ── Write TrialEscrow (if provided) ───────────────────────────────────
+        if let Some(escrow_rec) = escrow {
+            let te_key = DataKey::TrialEscrow(player_id, trial_index);
+            env.storage().persistent().set(&te_key, &escrow_rec);
+            env.storage()
+                .persistent()
+                .extend_ttl(&te_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
+        // ── Increment TrialCounter ────────────────────────────────────────────
+        env.storage().persistent().set(&tc_key, &trial_index);
+        env.storage()
+            .persistent()
+            .extend_ttl(&tc_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        // ── Update ScoutTrialOffers ───────────────────────────────────────────
+        let sto_key = DataKey::ScoutTrialOffers(offer.scout.clone());
+        let mut sto: Vec<(u64, u32)> = env
+            .storage()
+            .persistent()
+            .get(&sto_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !sto
+            .iter()
+            .any(|(pid, tidx)| pid == player_id && tidx == trial_index)
+        {
+            sto.push_back((player_id, trial_index));
+            env.storage().persistent().set(&sto_key, &sto);
+            env.storage()
+                .persistent()
+                .extend_ttl(&sto_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+
+        Ok(())
+    }
+
+    /// Seed the auto-renewal opt-in flag for a scout.
+    ///
+    /// MIGRATION_GAPS row 13.  Reconstructs `AutoRenew(scout)` → bool.
+    ///
+    /// ## Idempotency
+    ///
+    /// If the same `enabled` value is already stored → no-op.
+    /// If a *different* value is stored → `AutoRenewAlreadyExists`.
+    pub fn admin_seed_auto_renew(
+        env: Env,
+        scout: Address,
+        enabled: bool,
+    ) -> Result<(), ScoutAccessError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_migration_active(&env)?;
+
+        let ar_key = DataKey::AutoRenew(scout.clone());
+
+        // ── Idempotency ───────────────────────────────────────────────────────
+        if let Some(existing) = env.storage().persistent().get::<DataKey, bool>(&ar_key) {
+            if existing == enabled {
+                return Ok(());
+            }
+            return Err(ScoutAccessError::AutoRenewAlreadyExists);
+        }
+
+        env.storage().persistent().set(&ar_key, &enabled);
+        env.storage()
+            .persistent()
+            .extend_ttl(&ar_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+
+        Ok(())
+    }
+
+    /// Seed the current fee configuration and its bounded history from a prior
+    /// deployment. This is intentionally one atomic replacement rather than a
+    /// loop of `update_fee_config` calls: replay preserves the original
+    /// timestamps and does not manufacture fee-config events or delays.
+    pub fn admin_seed_fee_config(
+        env: Env,
+        config: FeeConfig,
+        history: Vec<FeeConfigHistoryEntry>,
+    ) -> Result<(), ScoutAccessError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_migration_active(&env)?;
+
+        const HISTORY_CAP: u32 = 5;
+        if history.len() > HISTORY_CAP {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
+        let history_key = DataKey::FeeConfigHistory;
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<FeeConfigHistoryEntry>>(&history_key)
+        {
+            let identical = existing.len() == history.len()
+                && (0..existing.len()).all(|i| existing.get(i) == history.get(i));
+            if !identical {
+                return Err(ScoutAccessError::FeeConfigHistoryAlreadyExists);
+            }
+        }
+
+        Self::validate_fee_config(&config)?;
+        env.storage().instance().set(&DataKey::FeeConfig, &config);
+        env.storage().instance().set(&history_key, &history);
+        Ok(())
+    }
+
+    /// Seed only the bounded fee-configuration history when the current config
+    /// was already restored by the deployment initializer.
+    pub fn admin_seed_fee_config_history(
+        env: Env,
+        history: Vec<FeeConfigHistoryEntry>,
+    ) -> Result<(), ScoutAccessError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_migration_active(&env)?;
+
+        const HISTORY_CAP: u32 = 5;
+        if history.len() > HISTORY_CAP {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
+        let key = DataKey::FeeConfigHistory;
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<FeeConfigHistoryEntry>>(&key)
+        {
+            let identical = existing.len() == history.len()
+                && (0..existing.len()).all(|i| existing.get(i) == history.get(i));
+            if identical {
+                return Ok(());
+            }
+            return Err(ScoutAccessError::FeeConfigHistoryAlreadyExists);
+        }
+
+        env.storage().instance().set(&key, &history);
+        Ok(())
+    }
+
     pub fn health(env: Env) -> ContractHealth {
         let initialized = env
             .storage()
@@ -1731,9 +2744,15 @@ impl ScoutAccessContract {
             .instance()
             .get::<DataKey, bool>(&DataKey::Paused)
             .unwrap_or(false);
+        let pay_to_contact_paused = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::PausedPayToContact)
+            .unwrap_or(false);
         ContractHealth {
             initialized,
             paused,
+            pay_to_contact_paused,
         }
     }
 
@@ -1768,7 +2787,6 @@ impl ScoutAccessContract {
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    #[allow(dead_code)]
     fn add_to_tier_index(env: &Env, scout: &Address, tier: &SubscriptionTier) {
         let key = DataKey::TierSubscribers(tier.clone());
         let mut subscribers: Vec<Address> = env
@@ -1822,6 +2840,25 @@ impl ScoutAccessContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        Self::track_min_expiry_bucket_day(env, day);
+    }
+
+    /// Record the earliest populated expiry-bucket day so
+    /// `get_expiring_subscriptions` can start its bucket scan there instead of
+    /// at day 0. Only ever lowers the stored value (monotonic minimum), so it
+    /// remains a safe lower bound even after a bucket later empties via
+    /// `remove_from_expiry_bucket`.
+    fn track_min_expiry_bucket_day(env: &Env, day: u64) {
+        let current: u64 = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::MinExpiryBucketDay)
+            .unwrap_or(u64::MAX);
+        if day < current {
+            env.storage()
+                .instance()
+                .set(&DataKey::MinExpiryBucketDay, &day);
+        }
     }
 
     /// Remove `scout` from the day-granularity expiry bucket for `expires_at`.
@@ -1859,6 +2896,18 @@ impl ScoutAccessContract {
         Ok(())
     }
 
+    fn require_migration_active(env: &Env) -> Result<(), ScoutAccessError> {
+        let active = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MigrationActive)
+            .unwrap_or(false);
+        if !active {
+            return Err(ScoutAccessError::MigrationNotActive);
+        }
+        Ok(())
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), ScoutAccessError> {
         if env
             .storage()
@@ -1867,6 +2916,22 @@ impl ScoutAccessContract {
             .unwrap_or(false)
         {
             return Err(ScoutAccessError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Check that `pay_to_contact` is not paused (function-scoped circuit
+    /// breaker). Independent of the whole-contract `Paused` flag; defaults to
+    /// `false` (not paused) when the flag has never been set. Mirrors
+    /// `verification::require_approve_milestone_not_paused`. (issue #1056)
+    fn require_pay_to_contact_not_paused(env: &Env) -> Result<(), ScoutAccessError> {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::PausedPayToContact)
+            .unwrap_or(false)
+        {
+            return Err(ScoutAccessError::PayToContactPaused);
         }
         Ok(())
     }
@@ -1929,8 +2994,7 @@ impl ScoutAccessContract {
             .instance()
             .get(&DataKey::AccumulatedFees)
             .unwrap_or(0i128);
-        let new_total = safe_add_i128(current, amount)
-            .map_err(|_| ScoutAccessError::Overflow)?;
+        let new_total = safe_add_i128(current, amount).map_err(|_| ScoutAccessError::Overflow)?;
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &new_total);
@@ -1958,7 +3022,7 @@ impl ScoutAccessContract {
             || config.pro_sub_stroops < MIN_SUB_FEE_STROOPS
             || config.elite_sub_stroops < MIN_SUB_FEE_STROOPS
             || config.sub_duration_secs == 0
-            || config.trial_offer_escrow_stroops < 0
+            || config.trial_offer_escrow_stroops <= 0
             || config.trial_offer_expiry_secs == 0
             || config.pro_contact_limit == 0
         {
@@ -1975,56 +3039,6 @@ impl ScoutAccessContract {
             SubscriptionTier::Elite => 3,
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Issue #821: Bounded trial-escrow enumeration index
-    // -------------------------------------------------------------------------
-    //
-    // A swap-remove Vec stored under `DataKey::TrialEscrowIndex` provides
-    // O(1) insertion, O(1) removal, and iteration cost bounded by the number
-    // of *currently outstanding* trial offers, not total historical volume.
-
-    fn trial_escrow_index_insert(env: &Env, player_id: u64, trial_index: u32) {
-        let mut index: Vec<(u64, u32)> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TrialEscrowIndex)
-            .unwrap_or_else(|| Vec::new(env));
-        index.push_back((player_id, trial_index));
-        env.storage()
-            .persistent()
-            .set(&DataKey::TrialEscrowIndex, &index);
-    }
-
-    fn trial_escrow_index_remove(env: &Env, player_id: u64, trial_index: u32) {
-        let mut index: Vec<(u64, u32)> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TrialEscrowIndex)
-            .unwrap_or_else(|| Vec::new(env));
-
-        if let Some(pos) = index.iter().position(|(pid, tid)| *pid == player_id && *tid == trial_index) {
-            // Swap-remove: move last element into the removed slot, then pop.
-            let last = index.len() - 1;
-            if pos != last {
-                index.swap(pos, last);
-            }
-            index.pop();
-            env.storage()
-                .persistent()
-                .set(&DataKey::TrialEscrowIndex, &index);
-        }
-    }
-
-    /// Iterate all outstanding trial escrows. Used by `expire_trial_offers`.
-    pub(crate) fn trial_escrow_index_iter(env: &Env) -> Vec<(u64, u32)> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::TrialEscrowIndex)
-            .unwrap_or_else(|| Vec::new(env))
-            .iter()
-            .collect::<Vec<_>>()
-    }
 }
 
 // =============================================================================
@@ -2032,7 +3046,7 @@ impl ScoutAccessContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{storage::Instance, Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+        testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
         token::{Client as TokenClient, StellarAssetClient},
         Env, IntoVal, String, Symbol,
     };
@@ -2070,7 +3084,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
         client.initialize(&admin, &xlm, &default_fees());
         (env, admin, xlm, contract_id, client)
@@ -2082,7 +3096,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
 
         client.initialize(&admin, &xlm, &default_fees());
@@ -2125,7 +3139,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
 
         let res = client.try_initialize(&admin, &xlm, &default_fees());
@@ -2141,7 +3155,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let not_a_token = Address::generate(&env);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
 
         let res = client.try_initialize(&admin, &not_a_token, &default_fees());
@@ -2157,8 +3171,8 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
-        let not_a_token = env.register_contract(None, ScoutAccessContract);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let not_a_token = env.register(ScoutAccessContract, ());
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
 
         let res = client.try_initialize(&admin, &not_a_token, &default_fees());
@@ -2177,8 +3191,6 @@ mod tests {
             pro_sub_stroops: 5_000_000,
             elite_sub_stroops: 10_000_000,
             sub_duration_secs: 60 * 24 * 60 * 60,
-            trial_offer_escrow_stroops: 500_000,
-            trial_offer_expiry_secs: 3_600,
             pro_contact_limit: 20,
             trial_offer_escrow_stroops: 1_000_000,
             trial_offer_expiry_secs: 7_200,
@@ -2187,7 +3199,11 @@ mod tests {
         client.update_fee_config(&new_fees);
 
         // Assert that the fee_config_updated event was emitted with old and new
-        // config. Checked immediately — `events().all()` only reflects the most
+        // config, immediately followed by fee_config_delay_bypassed (#1055):
+        // update_fee_config is the atomic, no-delay path, so it must flag
+        // itself as such in the event stream, distinguishing it from an
+        // activate_fee_config call (which emits fee_config_updated alone).
+        // Checked immediately — `events().all()` only reflects the most
         // recent invocation, and the reads below are themselves separate invocations.
         let events = env.events().all().filter_by_contract(&contract_id);
         assert_eq!(
@@ -2197,6 +3213,15 @@ mod tests {
                 (
                     contract_id.clone(),
                     (Symbol::new(&env, "fee_config_updated"), _admin.clone(),).into_val(&env),
+                    (old_config.clone(), new_fees.clone()).into_val(&env)
+                ),
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, "fee_config_delay_bypassed"),
+                        _admin.clone(),
+                    )
+                        .into_val(&env),
                     (old_config, new_fees.clone()).into_val(&env)
                 )
             ]
@@ -2375,10 +3400,23 @@ mod tests {
         client.subscribe(&scout, &SubscriptionTier::Elite);
         client.pay_to_contact(&scout, &42u64);
 
+        // pay_to_contact emits two events in this order:
+        // 1. evidence_access_granted (EvidenceAccessGrant written atomically)
+        // 2. player_contacted
+        // Verify both events are present in the correct order.
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
             soroban_sdk::vec![
                 &env,
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, crate::events::EVIDENCE_ACCESS_GRANTED),
+                        scout.clone()
+                    )
+                        .into_val(&env),
+                    (42u64, SubscriptionTier::Elite).into_val(&env)
+                ),
                 (
                     contract_id.clone(),
                     (
@@ -2477,7 +3515,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
         let fees = FeeConfig {
             contact_fee_stroops: 100_000,
@@ -2500,9 +3538,9 @@ mod tests {
         client.pay_to_contact(&scout, &2u64);
         client.pay_to_contact(&scout, &3u64);
 
-        // Fourth contact must be rejected with ProContactLimitReached (#19).
+        // Fourth contact must be rejected with ContactQuotaExceeded (#1161 unification).
         let res = client.try_pay_to_contact(&scout, &4u64);
-        assert_eq!(res, Err(Ok(ScoutAccessError::ProContactLimitReached)));
+        assert_eq!(res, Err(Ok(ScoutAccessError::ContactQuotaExceeded)));
     }
 
     #[test]
@@ -2512,7 +3550,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
         let fees = FeeConfig {
             contact_fee_stroops: 100_000,
@@ -2544,7 +3582,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
         let period_secs: u64 = 30 * 24 * 60 * 60;
         let fees = FeeConfig {
@@ -2581,7 +3619,7 @@ mod tests {
         client.pay_to_contact(&scout, &4u64);
         assert_eq!(
             client.try_pay_to_contact(&scout, &5u64),
-            Err(Ok(ScoutAccessError::ProContactLimitReached))
+            Err(Ok(ScoutAccessError::ContactQuotaExceeded))
         );
     }
 
@@ -2591,7 +3629,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
 
         let bad_fees = FeeConfig {
@@ -2679,9 +3717,9 @@ mod tests {
         // Swept escrows are gone: confirming them now hits the "already
         // gone" path, since the TrialEscrow record no longer exists.
         let player_wallet = Address::generate(&env);
-        let res1 = client.try_confirm_trial_offer(&player_wallet, &1u64, &1u32);
+        let res1 = client.try_confirm_trial_offer(&player_wallet, &1u64, &1u32, &None);
         assert_eq!(res1, Err(Ok(ScoutAccessError::TrialOfferAlreadyConfirmed)));
-        let res2 = client.try_confirm_trial_offer(&player_wallet, &2u64, &1u32);
+        let res2 = client.try_confirm_trial_offer(&player_wallet, &2u64, &1u32, &None);
         assert_eq!(res2, Err(Ok(ScoutAccessError::TrialOfferAlreadyConfirmed)));
 
         // A second sweep finds nothing new to expire — offer 3 is not due yet.
@@ -2777,6 +3815,10 @@ mod tests {
         assert_eq!(client.get_trial_count(&1u64), 1);
     }
 
+    /// Issue: TrialCounter's TTL must be extended alongside TrialOffer in the
+    /// same log_trial_offer call, so a counter expiry never causes the next
+    /// offer to be written back to index 1 (overwriting/orphaning the first
+    /// offer that is still live).
     #[test]
     fn test_trial_counter_survives_ttl_expiry_and_continues_incrementing() {
         let (env, admin, xlm, _contract_id, client) = setup();
@@ -2799,12 +3841,20 @@ mod tests {
         );
         assert_eq!(idx1, 1);
 
+        // Advance past the default persistent entry TTL (500). Without the
+        // TrialCounter extend_ttl call, this would drop the counter back to
+        // 0 and the next offer would be written to index 1 again, silently
+        // overwriting the offer above.
         // Advance the ledger well past the default persistent entry TTL (500)
         // that a not-yet-extended TrialCounter would have expired at.
         env.ledger().with_mut(|l| {
             l.sequence_number = 100_000 + 1_000;
         });
 
+        // A second scout logs an offer for the same player. TrialCounter is
+        // keyed by player_id only, so this exercises the shared counter
+        // without depending on scout1's unrelated Subscription/ContactRecord
+        // TTL window.
         // TrialCounter must have survived the expiry window untouched.
         assert_eq!(client.get_trial_count(&1u64), 1);
 
@@ -2823,6 +3873,12 @@ mod tests {
             &String::from_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB"),
         );
 
+        // The new offer must land at index 2, not collide with index 1.
+        assert_eq!(idx2, 2);
+        assert_eq!(client.get_trial_count(&1u64), 2);
+
+        // Neither offer is orphaned: both remain readable at their original
+        // indices with their original scout.
         // The counter must continue from 1, not reset (i.e. become 2), and
         // the original offer at index 1 must remain intact.
         assert_eq!(idx2, 2);
@@ -3014,8 +4070,12 @@ mod tests {
                 &env,
                 (
                     client.address.clone(),
-                    (Symbol::new(&env, crate::events::CONTRACT_PAUSED),).into_val(&env),
-                    admin.clone().into_val(&env)
+                    (
+                        Symbol::new(&env, crate::events::CONTRACT_PAUSED),
+                        admin.clone()
+                    )
+                        .into_val(&env),
+                    ().into_val(&env)
                 )
             ]
         );
@@ -3028,8 +4088,12 @@ mod tests {
                 &env,
                 (
                     client.address.clone(),
-                    (Symbol::new(&env, crate::events::CONTRACT_UNPAUSED),).into_val(&env),
-                    admin.clone().into_val(&env)
+                    (
+                        Symbol::new(&env, crate::events::CONTRACT_UNPAUSED),
+                        admin.clone()
+                    )
+                        .into_val(&env),
+                    ().into_val(&env)
                 )
             ]
         );
@@ -3117,14 +4181,14 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
         (env, admin, xlm, client)
     }
 
     #[test]
     fn test_initialize_zero_contact_fee_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             contact_fee_stroops: 0,
             ..default_fees()
@@ -3135,7 +4199,7 @@ mod tests {
 
     #[test]
     fn test_initialize_zero_basic_sub_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             basic_sub_stroops: 0,
             ..default_fees()
@@ -3146,7 +4210,7 @@ mod tests {
 
     #[test]
     fn test_initialize_zero_pro_sub_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             pro_sub_stroops: 0,
             ..default_fees()
@@ -3157,7 +4221,7 @@ mod tests {
 
     #[test]
     fn test_initialize_zero_elite_sub_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             elite_sub_stroops: 0,
             ..default_fees()
@@ -3168,7 +4232,7 @@ mod tests {
 
     #[test]
     fn test_initialize_zero_sub_duration_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             sub_duration_secs: 0,
             ..default_fees()
@@ -3179,7 +4243,7 @@ mod tests {
 
     #[test]
     fn test_initialize_negative_fee_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             contact_fee_stroops: -1,
             ..default_fees()
@@ -3190,7 +4254,7 @@ mod tests {
 
     #[test]
     fn test_initialize_valid_fee_config_succeeds() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let result = client.try_initialize(&admin, &xlm, &default_fees());
         assert!(result.is_ok());
     }
@@ -3240,8 +4304,6 @@ mod tests {
             trial_offer_escrow_stroops: 500_000,
             trial_offer_expiry_secs: 3_600,
             pro_contact_limit: 15,
-            trial_offer_escrow_stroops: 1_000_000,
-            trial_offer_expiry_secs: 7_200,
         };
         let result = client.try_update_fee_config(&new_fees);
         assert!(result.is_ok());
@@ -3255,7 +4317,7 @@ mod tests {
 
     #[test]
     fn test_initialize_zero_trial_escrow_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             trial_offer_escrow_stroops: 0,
             ..default_fees()
@@ -3266,7 +4328,7 @@ mod tests {
 
     #[test]
     fn test_initialize_zero_trial_expiry_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             trial_offer_expiry_secs: 0,
             ..default_fees()
@@ -3277,7 +4339,7 @@ mod tests {
 
     #[test]
     fn test_initialize_negative_trial_escrow_returns_invalid_input() {
-        let (env, admin, xlm, client) = make_contract();
+        let (_env, admin, xlm, client) = make_contract();
         let bad_fees = FeeConfig {
             trial_offer_escrow_stroops: -1,
             ..default_fees()
@@ -3306,60 +4368,6 @@ mod tests {
         };
         let result = client.try_update_fee_config(&bad_fees);
         assert_eq!(result, Err(Ok(ScoutAccessError::InvalidInput)));
-    }
-
-    // -------------------------------------------------------------------------
-    // Issue #821: Trial escrow enumeration index tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_trial_escrow_index_insert_and_iter() {
-        let (env, admin, xlm, client) = make_contract();
-        let scout = Address::generate(&env);
-        let player_id = 1u64;
-
-        // Log two trial offers for the same player.
-        let idx1 = client.log_trial_offer(&scout, &player_id, &String::from_str(&env, "QmHash1"));
-        let idx2 = client.log_trial_offer(&scout, &player_id, &String::from_str(&env, "QmHash2"));
-
-        // The index should contain both entries.
-        let index = ScoutAccessContract::trial_escrow_index_iter(&env);
-        assert_eq!(index.len(), 2);
-        assert!(index.contains(&(player_id, idx1)));
-        assert!(index.contains(&(player_id, idx2)));
-    }
-
-    #[test]
-    fn test_trial_escrow_index_remove_does_not_grow() {
-        let (env, admin, xlm, client) = make_contract();
-        let scout = Address::generate(&env);
-        let player_id = 1u64;
-
-        let idx1 = client.log_trial_offer(&scout, &player_id, &String::from_str(&env, "QmHash1"));
-        let idx2 = client.log_trial_offer(&scout, &player_id, &String::from_str(&env, "QmHash2"));
-        let _idx3 = client.log_trial_offer(&scout, &player_id, &String::from_str(&env, "QmHash3"));
-
-        // Confirm the middle entry out of order.
-        client.confirm_trial_offer(&player_id, &idx2);
-
-        let index = ScoutAccessContract::trial_escrow_index_iter(&env);
-        assert_eq!(index.len(), 2);
-        assert!(!index.contains(&(player_id, idx2)));
-        assert!(index.contains(&(player_id, idx1)));
-        assert!(index.contains(&(player_id, _idx3)));
-    }
-
-    #[test]
-    fn test_trial_escrow_index_remove_all() {
-        let (env, admin, xlm, client) = make_contract();
-        let scout = Address::generate(&env);
-        let player_id = 1u64;
-
-        let idx1 = client.log_trial_offer(&scout, &player_id, &String::from_str(&env, "QmHash1"));
-        client.confirm_trial_offer(&player_id, &idx1);
-
-        let index = ScoutAccessContract::trial_escrow_index_iter(&env);
-        assert!(index.is_empty());
     }
 
     // -------------------------------------------------------------------------
@@ -3586,7 +4594,7 @@ mod tests {
 
     #[test]
     fn test_pause_contract_emits_contract_paused_event() {
-        let (env, admin, xlm, contract_id, client) = setup();
+        let (env, admin, _xlm, contract_id, client) = setup();
 
         // Pause the contract
         client.pause_contract();
@@ -3609,6 +4617,7 @@ mod tests {
         assert!(client.health().paused);
     }
 
+    #[test]
     fn test_refund_subscription_success() {
         let (env, admin, xlm, _contract_id, client) = setup();
         let scout = Address::generate(&env);
@@ -3682,6 +4691,9 @@ mod tests {
 
         client.set_progress_contract(&progress_addr);
 
+        // set_progress_contract now emits both the legacy
+        // progress_contract_updated event and the new wiring_updated event
+        // (issue #1041) on every successful call.
         assert_eq!(
             env.events().all().filter_by_contract(&contract_id),
             soroban_sdk::vec![
@@ -3694,6 +4706,16 @@ mod tests {
                     )
                         .into_val(&env),
                     progress_addr.clone().into_val(&env),
+                ),
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, crate::events::WIRING_UPDATED),
+                        _admin.clone(),
+                        Symbol::new(&env, "progress_contract"),
+                    )
+                        .into_val(&env),
+                    (progress_addr.clone(), 1u32).into_val(&env),
                 )
             ]
         );
@@ -3719,6 +4741,94 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Wiring observability (issue #1041)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_get_progress_contract_before_and_after_configuration() {
+        let (env, _admin, _xlm, _contract_id, client) = setup();
+
+        assert_eq!(client.get_progress_contract(), None);
+
+        let progress_addr = Address::generate(&env);
+        client.set_progress_contract(&progress_addr);
+        assert_eq!(client.get_progress_contract(), Some(progress_addr));
+    }
+
+    #[test]
+    fn test_get_wiring_state_initially_unconfigured() {
+        let (_, _admin, _xlm, _contract_id, client) = setup();
+
+        let state = client.get_wiring_state();
+        assert_eq!(state.progress_contract.address, None);
+        assert_eq!(state.progress_contract.epoch, 0);
+        assert_eq!(state.registration_contract.address, None);
+        assert_eq!(state.registration_contract.epoch, 0);
+        assert!(!state.is_fully_wired());
+    }
+
+    #[test]
+    fn test_get_wiring_state_reflects_both_links_and_bumps_epoch() {
+        let (env, _admin, _xlm, _contract_id, client) = setup();
+
+        let progress_addr = Address::generate(&env);
+        let reg_addr = Address::generate(&env);
+        client.set_progress_contract(&progress_addr);
+        client.set_registration_contract(&reg_addr);
+
+        let state = client.get_wiring_state();
+        assert_eq!(state.progress_contract.address, Some(progress_addr));
+        assert_eq!(state.progress_contract.epoch, 1);
+        assert_eq!(state.registration_contract.address, Some(reg_addr));
+        assert_eq!(state.registration_contract.epoch, 1);
+        assert!(state.is_fully_wired());
+
+        // Freely re-settable — no first-call-only guard on either link — and
+        // a second call must bump the epoch again, not reset it.
+        let new_progress_addr = Address::generate(&env);
+        client.set_progress_contract(&new_progress_addr);
+        assert_eq!(
+            client.get_wiring_state().progress_contract.epoch,
+            2,
+            "re-wiring the same link must bump its epoch again"
+        );
+    }
+
+    #[test]
+    fn test_set_registration_contract_emits_wiring_updated_event() {
+        let (env, _admin, _xlm, contract_id, client) = setup();
+        let reg_addr = Address::generate(&env);
+
+        client.set_registration_contract(&reg_addr);
+
+        assert_eq!(
+            env.events().all().filter_by_contract(&contract_id),
+            soroban_sdk::vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, crate::events::REGISTRATION_CONTRACT_UPDATED),
+                        _admin.clone(),
+                    )
+                        .into_val(&env),
+                    reg_addr.clone().into_val(&env),
+                ),
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, crate::events::WIRING_UPDATED),
+                        _admin.clone(),
+                        Symbol::new(&env, "registration_contract"),
+                    )
+                        .into_val(&env),
+                    (reg_addr, 1u32).into_val(&env),
+                )
+            ]
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Integration test: log_trial_offer advances player to EliteTier via the
     // real progress contract cross-contract call.
     // -------------------------------------------------------------------------
@@ -3735,13 +4845,13 @@ mod tests {
         env.mock_all_auths();
 
         // --- deploy verification contract ---
-        let ver_id = env.register_contract(None, VerificationContract);
+        let ver_id = env.register(VerificationContract, ());
         let ver_client = VerificationContractClient::new(&env, &ver_id);
         let ver_admin = Address::generate(&env);
         ver_client.initialize(&ver_admin);
 
         // --- deploy progress contract ---
-        let progress_id = env.register_contract(None, ProgressContract);
+        let progress_id = env.register(ProgressContract, ());
         let progress_client = ProgressContractClient::new(&env, &progress_id);
         let progress_admin = Address::generate(&env);
         progress_client.initialize(&progress_admin);
@@ -3750,7 +4860,7 @@ mod tests {
         // --- deploy scout_access contract ---
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let scout_access_id = env.register_contract(None, ScoutAccessContract);
+        let scout_access_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &scout_access_id);
         client.initialize(&admin, &xlm, &default_fees());
 
@@ -3773,12 +4883,13 @@ mod tests {
         // Register a milestone so the trial-offer's milestone_ref (index 1)
         // validates against the verification contract's milestone count.
         let validator = Address::generate(&env);
-        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA-B-License"), &Vec::new(&env));
+        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA-B-License"), &String::from_str(&env, "Default Academy"), &String::from_str(&env, "Default Region"), &Vec::new(&env));
         ver_client.approve_milestone(
             &validator,
             &player_id,
             &String::from_str(&env, "scored"),
             &String::from_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB"),
+            &None,
         );
 
         // Scout subscribes at Elite tier and logs a trial offer
@@ -3792,6 +4903,12 @@ mod tests {
             &String::from_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB"),
         );
         assert_eq!(idx, 1);
+
+        // log_trial_offer is step 1 of the two-step flow: it escrows funds but
+        // does NOT advance the level. The player must confirm the offer to
+        // release the escrow and advance to EliteTier (Level 3).
+        let player_wallet = Address::generate(&env);
+        client.confirm_trial_offer(&player_wallet, &player_id, &idx, &None);
 
         // Player must now be at EliteTier
         assert_eq!(
@@ -3812,13 +4929,13 @@ mod tests {
         env.mock_all_auths();
 
         // --- deploy verification contract ---
-        let ver_id = env.register_contract(None, VerificationContract);
+        let ver_id = env.register(VerificationContract, ());
         let ver_client = VerificationContractClient::new(&env, &ver_id);
         let ver_admin = Address::generate(&env);
         ver_client.initialize(&ver_admin);
 
         // --- deploy progress contract ---
-        let progress_id = env.register_contract(None, ProgressContract);
+        let progress_id = env.register(ProgressContract, ());
         let progress_client = ProgressContractClient::new(&env, &progress_id);
         let progress_admin = Address::generate(&env);
         progress_client.initialize(&progress_admin);
@@ -3827,7 +4944,7 @@ mod tests {
         // --- deploy scout_access contract ---
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let scout_access_id = env.register_contract(None, ScoutAccessContract);
+        let scout_access_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &scout_access_id);
         client.initialize(&admin, &xlm, &default_fees());
 
@@ -3850,12 +4967,13 @@ mod tests {
         // Register a milestone so the trial-offer's milestone_ref (index 1)
         // validates against the verification contract's milestone count.
         let validator = Address::generate(&env);
-        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA-B-License"), &Vec::new(&env));
+        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA-B-License"), &String::from_str(&env, "Default Academy"), &String::from_str(&env, "Default Region"), &Vec::new(&env));
         ver_client.approve_milestone(
             &validator,
             &player_id,
             &String::from_str(&env, "scored"),
             &String::from_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB"),
+            &None,
         );
 
         // log_trial_offer must still succeed even though AlreadyAtMaxLevel is returned
@@ -3886,7 +5004,7 @@ mod tests {
 
     #[test]
     fn test_subscribe_missing_xlm_token_returns_not_initialized() {
-        let (env, admin, xlm, contract_id, client) = setup();
+        let (env, _admin, _xlm, contract_id, client) = setup();
         // Remove the XlmToken key from instance storage to simulate expiry/absence.
         env.as_contract(&contract_id, || {
             env.storage().instance().remove(&DataKey::XlmToken);
@@ -4539,7 +5657,7 @@ mod tests {
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let xlm = create_token(&env, &admin);
-        let contract_id = env.register_contract(None, ScoutAccessContract);
+        let contract_id = env.register(ScoutAccessContract, ());
         let client = ScoutAccessContractClient::new(&env, &contract_id);
         let fees = FeeConfig {
             pro_contact_limit: 1,
@@ -4864,7 +5982,7 @@ mod tests {
     /// History is empty before any update_fee_config call.
     #[test]
     fn test_fee_config_history_empty_before_any_update() {
-        let (env, _admin, _xlm, _contract_id, client) = setup();
+        let (_env, _admin, _xlm, _contract_id, client) = setup();
         let history = client.get_fee_config_history();
         assert_eq!(history.len(), 0);
     }
@@ -4872,7 +5990,7 @@ mod tests {
     /// Each update_fee_config call appends the old config to history, oldest-first.
     #[test]
     fn test_fee_config_history_records_previous_configs_oldest_first() {
-        let (env, _admin, _xlm, _contract_id, client) = setup();
+        let (_env, _admin, _xlm, _contract_id, client) = setup();
 
         let fees_v2 = FeeConfig {
             contact_fee_stroops: 200_000,
@@ -4917,7 +6035,7 @@ mod tests {
     /// the oldest entry so the list never exceeds 5 items.
     #[test]
     fn test_fee_config_history_capped_at_five_entries() {
-        let (env, _admin, _xlm, _contract_id, client) = setup();
+        let (_env, _admin, _xlm, _contract_id, client) = setup();
 
         // Perform 6 updates; each one bumps the contact_fee by 100_000.
         for i in 1u32..=6 {
@@ -4956,18 +6074,27 @@ mod tests {
 
         // Opt in.
         client.set_auto_renew(&scout, &true);
-        assert!(client.get_auto_renew(&scout));
 
-        let events = env.events().all().filter_by_contract(&contract_id);
-        assert_eq!(events.len(), 1);
-        let (_, topics_val, data_val) = events.get(0).unwrap();
-        let topics: soroban_sdk::Vec<soroban_sdk::Val> =
-            soroban_sdk::Vec::try_from_val(&env, &topics_val).unwrap();
+        // env.events().all() only returns events from the most recent contract
+        // invocation, so it must be read immediately after the write — a later
+        // view call (e.g. get_auto_renew) would clear the buffer.
+        let events = env.events().all();
         assert_eq!(
-            topics.get(0).unwrap(),
-            Symbol::new(&env, crate::events::AUTO_RENEW_SET).into_val(&env)
+            events,
+            soroban_sdk::vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (
+                        Symbol::new(&env, crate::events::AUTO_RENEW_SET),
+                        scout.clone()
+                    )
+                        .into_val(&env),
+                    true.into_val(&env),
+                )
+            ]
         );
-        assert_eq!(data_val, true.into_val(&env));
+        assert!(client.get_auto_renew(&scout));
 
         // Opt back out.
         client.set_auto_renew(&scout, &false);
@@ -4986,9 +6113,9 @@ mod tests {
 
         // The subscription was just created — we are nowhere near the renewal
         // window.  renew_if_due should return Ok and do nothing (no charge).
-        let before = client.get_subscription(&scout).unwrap();
+        let before = client.get_subscription(&scout);
         client.renew_if_due(&scout);
-        let after = client.get_subscription(&scout).unwrap();
+        let after = client.get_subscription(&scout);
         assert_eq!(before.expires_at, after.expires_at);
     }
 
@@ -5006,7 +6133,7 @@ mod tests {
         client.subscribe(&scout, &SubscriptionTier::Basic);
         client.set_auto_renew(&scout, &true);
 
-        let before = client.get_subscription(&scout).unwrap();
+        let before = client.get_subscription(&scout);
 
         // Jump to 96 % of the way through the subscription (inside the last-10%-window).
         let renewal_ts = before.expires_at - sub_duration / 20; // ~95 % in
@@ -5014,10 +6141,12 @@ mod tests {
 
         client.renew_if_due(&scout);
 
-        let after = client.get_subscription(&scout).unwrap();
+        let after = client.get_subscription(&scout);
         // A new subscription was written; expires_at must advance.
-        assert!(after.expires_at > before.expires_at);
-        assert_eq!(after.subscribed_at, renewal_ts);
+        // Renewal inside the pre-expiry window is anchored to the prior expiry,
+        // not to the renewal timestamp, so the next period is contiguous.
+        assert_eq!(after.expires_at, before.expires_at + sub_duration);
+        assert_eq!(after.subscribed_at, before.expires_at);
     }
 
     #[test]
@@ -5034,18 +6163,52 @@ mod tests {
         client.subscribe(&scout, &SubscriptionTier::Elite);
         client.set_auto_renew(&scout, &true);
 
-        let before = client.get_subscription(&scout).unwrap();
+        let before = client.get_subscription(&scout);
 
         // Jump past expiry.
-        env.ledger().with_mut(|l| l.timestamp = before.expires_at + 100);
+        env.ledger()
+            .with_mut(|l| l.timestamp = before.expires_at + 100);
 
         client.renew_if_due(&scout);
 
-        let after = client.get_subscription(&scout).unwrap();
+        let after = client.get_subscription(&scout);
         assert!(after.expires_at > before.expires_at);
         // expires_at should be roughly now + sub_duration.
         let expected_expiry = before.expires_at + 100 + sub_duration;
         assert_eq!(after.expires_at, expected_expiry);
+    }
+
+    #[test]
+    fn test_renew_if_due_12_late_renewals_keep_full_coverage() {
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, _admin, xlm, _contract_id, client) = setup();
+        let scout = Address::generate(&env);
+        mint_token(&env, &xlm, &_admin, &scout, 100_000_000);
+
+        let sub_duration: u64 = 30 * 24 * 60 * 60;
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        client.subscribe(&scout, &SubscriptionTier::Basic);
+        client.set_auto_renew(&scout, &true);
+
+        let mut sub = client.get_subscription(&scout);
+        let initial_expiry = sub.expires_at;
+
+        // Each keeper run is one hour after the current expiry — late, but
+        // still within the renewal window the keeper is expected to use.
+        for _ in 0..12 {
+            env.ledger()
+                .with_mut(|l| l.timestamp = sub.expires_at + 3600);
+            client.renew_if_due(&scout);
+            sub = client.get_subscription(&scout);
+        }
+
+        // The 12 renewals must deliver 12 full subscription durations of
+        // additional coverage, with only the one-hour lateness added.
+        assert_eq!(
+            sub.expires_at,
+            initial_expiry + sub_duration * 12 + 3600 * 12,
+        );
     }
 
     #[test]
@@ -5071,5 +6234,82 @@ mod tests {
 
         let result = client.try_renew_if_due(&scout);
         assert_eq!(result, Err(Ok(ScoutAccessError::ScoutNotSubscribed)));
+    }
+
+    /// Regression test for the TrialEscrow TTL bug.
+    ///
+    /// Before the fix, `log_trial_offer` wrote `DataKey::TrialEscrow` via
+    /// `.set()` but never called `extend_ttl` on it, leaving it with Soroban's
+    /// default minimal persistent TTL (~4,096 ledgers ≈ 5.7 hours). This is
+    /// shorter than `trial_offer_expiry_secs` (1 hour in the test default
+    /// config), but more importantly it is shorter than the platform's 30-day
+    /// activity cycle, meaning the record could be silently archived before
+    /// either `confirm_trial_offer` or `expire_trial_offers` ran — locking
+    /// the escrowed XLM with no normal read path to resolve it.
+    ///
+    /// After the fix, `log_trial_offer` extends the TTL to `TRIAL_TTL_EXTEND_TO`
+    /// (518,400 ledgers ≈ 30 days), well beyond the default. This test:
+    /// 1. Calls `log_trial_offer` and asserts the TTL is immediately set to the
+    ///    full policy value (> 5,000 ledgers, far above any reasonable default).
+    /// 2. Advances the ledger sequence past the old default TTL (~4,096 ledgers)
+    ///    and asserts the `TrialEscrow` entry is still present (not archived).
+    #[test]
+    fn test_trial_escrow_ttl_extended_on_log_trial_offer() {
+        use soroban_sdk::testutils::{storage::Persistent, Ledger};
+
+        let (env, _admin, xlm, _contract_id, client) = setup();
+
+        // Start at a known sequence with headroom for max_entry_ttl.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100_000;
+            l.min_persistent_entry_ttl = 500;
+            l.max_entry_ttl = 600_000;
+        });
+
+        let scout = Address::generate(&env);
+        // Fund with enough XLM for Elite subscription + escrow.
+        mint_token(&env, &xlm, &_admin, &scout, 100_000_000);
+        client.subscribe(&scout, &SubscriptionTier::Elite);
+        client.pay_to_contact(&scout, &1u64);
+
+        let index = client.log_trial_offer(
+            &scout,
+            &1u64,
+            &String::from_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB"),
+        );
+        assert_eq!(index, 1);
+
+        // --- Assertion 1: TTL is immediately extended to the policy value ---
+        // The write-side fix calls extend_ttl(..., TRIAL_TTL_THRESHOLD=259_200,
+        // TRIAL_TTL_EXTEND_TO=518_400), so the stored TTL must be substantially
+        // larger than the minimal default (~500 in this test environment).
+        env.as_contract(&client.address, || {
+            let ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::TrialEscrow(1u64, index));
+            assert!(
+                ttl > 5_000,
+                "TrialEscrow TTL should be extended to policy value after log_trial_offer, got {}",
+                ttl
+            );
+        });
+
+        // --- Assertion 2: Entry survives past the old default persistent TTL ---
+        // Without the fix, the default TTL would be 500 ledgers (our test env
+        // min_persistent_entry_ttl). Advance well past that.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100_000 + 2_000; // 4× the default test TTL
+        });
+
+        // The TrialEscrow entry must still be accessible — not archived.
+        env.as_contract(&client.address, || {
+            assert!(
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::TrialEscrow(1u64, index)),
+                "TrialEscrow must still be present after advancing past the old default TTL"
+            );
+        });
     }
 }
