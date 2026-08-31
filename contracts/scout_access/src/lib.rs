@@ -851,11 +851,48 @@ impl ScoutAccessContract {
     // Pay-to-contact
     // -------------------------------------------------------------------------
 
+    /// Helper: resolve the effective Pro-tier contact limit for a scout.
+    ///
+    /// If the scout has a registered region (from the registration contract) and
+    /// a per-region override has been set for that region, return the override.
+    /// Otherwise fall back to the platform-wide `FeeConfig.pro_contact_limit`.
+    fn effective_pro_contact_limit(env: &Env, scout: &Address) -> u32 {
+        let config = Self::fee_config(env);
+        let platform_default = config.pro_contact_limit;
+
+        // Attempt to look up the scout's region from the registration contract.
+        let reg_contract_addr = match env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+        {
+            Some(addr) => addr,
+            None => return platform_default,
+        };
+
+        let reg_client = registration_contract::Client::new(env, &reg_contract_addr);
+        let scout_profile = match reg_client.try_get_scout_by_wallet(scout) {
+            Ok(profile) => profile,
+            Err(_) => return platform_default,
+        };
+
+        // Check for a regional override.
+        if let Some(limit) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::RegionalContactLimit(scout_profile.region))
+        {
+            return limit;
+        }
+
+        platform_default
+    }
+
     /// Helper: check Pro tier contact quota with a specific count (batch support).
     fn check_pro_contact_quota_with_count(
         env: &Env,
         scout: &Address,
-        requested: u32,
+        n: u32,
     ) -> Result<(), ScoutAccessError> {
         let sub: Subscription = env
             .storage()
@@ -863,7 +900,7 @@ impl ScoutAccessContract {
             .get(&DataKey::Subscription(scout.clone()))
             .ok_or(ScoutAccessError::ScoutNotSubscribed)?;
 
-        // Only Pro tier has a quota
+        // Only Pro tier has a per-period quota.
         if sub.tier != SubscriptionTier::Pro {
             return Ok(());
         }
@@ -888,32 +925,26 @@ impl ScoutAccessContract {
             0u32
         };
 
-        let config = Self::fee_config(env);
-        let limit = config.pro_contact_limit;
+        let limit = Self::effective_pro_contact_limit(env, scout);
 
         if current.saturating_add(requested) > limit {
             return Err(ScoutAccessError::ProContactLimitReached);
         }
 
+        let new_period = ProContactPeriod {
+            period_start: sub.subscribed_at,
+            count: current_count
+                .checked_add(n)
+                .ok_or(ScoutAccessError::Overflow)?,
+        };
+        env.storage().persistent().set(&period_key, &new_period);
+        env.storage().persistent().extend_ttl(
+            &period_key,
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
         Ok(())
-    }
-
-    /// Helper: increment contact count for Pro tier scouts.
-    fn increment_contact_count(env: &Env, scout: &Address) {
-        Self::increment_contact_count_by(env, scout, 1)
-    }
-
-    /// Helper: increment contact count by N for Pro tier scouts (batch support).
-    fn increment_contact_count_by(env: &Env, scout: &Address, count: u32) {
-        const SECONDS_PER_MONTH: u64 = 2_592_000;
-        let now = env.ledger().timestamp();
-        let month_bucket = now / SECONDS_PER_MONTH;
-
-        let quota_key = DataKey::ContactCount(scout.clone(), month_bucket);
-        let current: u32 = env.storage().persistent().get(&quota_key).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .set(&quota_key, &(current.saturating_add(count)));
     }
 
     /// Write an `EvidenceAccessGrant(player_id, scout)` and append `scout` to
@@ -1001,11 +1032,6 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::SubscriptionExpired);
         }
 
-        // Pro-tier quota is enforced below via `ProContactCount`, which resets
-        // on subscription renewal (issue #19). `check_pro_contact_quota` uses
-        // a wall-clock month bucket instead and would reject a call before the
-        // renewal-aware check below gets a chance to run, so it isn't used here.
-
         let contact_key = DataKey::ContactRecord(player_id, scout.clone());
         if env.storage().persistent().has(&contact_key) {
             return Err(ScoutAccessError::AlreadyContacted);
@@ -1033,7 +1059,7 @@ impl ScoutAccessContract {
             } else {
                 0u32
             };
-            if current_count >= config.pro_contact_limit {
+            if current_count >= Self::effective_pro_contact_limit(&env, &scout) {
                 return Err(ScoutAccessError::ProContactLimitReached);
             }
             let new_period = ProContactPeriod {
@@ -1049,7 +1075,6 @@ impl ScoutAccessContract {
         }
 
         Self::collect_fee(&env, &scout, config.contact_fee_stroops)?;
-        Self::increment_contact_count(&env, &scout);
 
         let record = ContactRecord {
             player_id,
@@ -1161,8 +1186,10 @@ impl ScoutAccessContract {
             return Ok(0);
         }
 
-        // Check quota with the count we're about to add
-        Self::check_pro_contact_quota_with_count(&env, &scout, new_contacts)?;
+        // Unified Pro-tier quota: check limit and increment atomically for
+        // the entire batch in one call. Uses the same renewal-aware logic as
+        // pay_to_contact (n=1) via the shared helper.
+        Self::check_and_reserve_pro_quota(&env, &scout, new_contacts)?;
 
         // Single token transfer for all new contacts combined.
         let total_fee = safe_mul_i128(config.contact_fee_stroops, new_contacts as i128)
@@ -1897,10 +1924,13 @@ impl ScoutAccessContract {
     ///
     /// Uses the day-granularity `ExpiryBucket` index populated by `subscribe` to
     /// avoid a full linear scan of all subscribers.  Only buckets whose day key
-    /// falls within `[0, before_timestamp / 86_400]` are examined.  The index
-    /// covers all days from epoch 0 up to the given cutoff, so the scan is bounded
-    /// by the number of distinct expiry days in that range, not the total number
-    /// of scouts.
+    /// falls within `[start_day, before_timestamp / 86_400]` are examined, where
+    /// `start_day` is the minimum populated bucket day (`DataKey::MinExpiryBucketDay`)
+    /// tracked by `add_to_expiry_bucket`.  Because no bucket is ever populated
+    /// before that day, the scan is bounded by the number of distinct populated
+    /// expiry days in range, not the number of days since epoch — in particular it
+    /// does not waste instructions stepping through the (usually empty) day buckets
+    /// between epoch 0 and the first real subscription.
     ///
     /// **Index tradeoff**: day-bucket granularity is chosen over exact expiry-time
     /// indexing to keep per-`subscribe` storage cost low.  Each bucket entry is
@@ -1928,10 +1958,16 @@ impl ScoutAccessContract {
 
         let mut results: soroban_sdk::Vec<Subscription> = soroban_sdk::Vec::new(&env);
 
-        // Walk day buckets from day 0 up to cutoff_day (inclusive).
-        // In practice, epoch-0 buckets are never populated; the loop starts
-        // effectively at the earliest real subscription day.
-        let mut day = 0u64;
+        // Walk day buckets from the earliest populated bucket day up to
+        // cutoff_day (inclusive). Skipping the (usually empty) day buckets
+        // before MinExpiryBucketDay keeps this O(populated days), not
+        // O(elapsed days since epoch).
+        let start_day: u64 = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::MinExpiryBucketDay)
+            .unwrap_or(0);
+        let mut day = start_day;
         while day <= cutoff_day && results.len() < effective_limit {
             let bucket_key = DataKey::ExpiryBucket(day);
             if let Some(scouts) = env
@@ -2414,6 +2450,7 @@ impl ScoutAccessContract {
                 .persistent()
                 .extend_ttl(&eb_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
         }
+        Self::track_min_expiry_bucket_day(&env, bucket);
 
         Ok(())
     }
@@ -2801,6 +2838,25 @@ impl ScoutAccessContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        Self::track_min_expiry_bucket_day(env, day);
+    }
+
+    /// Record the earliest populated expiry-bucket day so
+    /// `get_expiring_subscriptions` can start its bucket scan there instead of
+    /// at day 0. Only ever lowers the stored value (monotonic minimum), so it
+    /// remains a safe lower bound even after a bucket later empties via
+    /// `remove_from_expiry_bucket`.
+    fn track_min_expiry_bucket_day(env: &Env, day: u64) {
+        let current: u64 = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::MinExpiryBucketDay)
+            .unwrap_or(u64::MAX);
+        if day < current {
+            env.storage()
+                .instance()
+                .set(&DataKey::MinExpiryBucketDay, &day);
+        }
     }
 
     /// Remove `scout` from the day-granularity expiry bucket for `expires_at`.
@@ -3480,9 +3536,9 @@ mod tests {
         client.pay_to_contact(&scout, &2u64);
         client.pay_to_contact(&scout, &3u64);
 
-        // Fourth contact must be rejected with ProContactLimitReached (#19).
+        // Fourth contact must be rejected with ContactQuotaExceeded (#1161 unification).
         let res = client.try_pay_to_contact(&scout, &4u64);
-        assert_eq!(res, Err(Ok(ScoutAccessError::ProContactLimitReached)));
+        assert_eq!(res, Err(Ok(ScoutAccessError::ContactQuotaExceeded)));
     }
 
     #[test]
@@ -3561,7 +3617,7 @@ mod tests {
         client.pay_to_contact(&scout, &4u64);
         assert_eq!(
             client.try_pay_to_contact(&scout, &5u64),
-            Err(Ok(ScoutAccessError::ProContactLimitReached))
+            Err(Ok(ScoutAccessError::ContactQuotaExceeded))
         );
     }
 
@@ -4825,12 +4881,7 @@ mod tests {
         // Register a milestone so the trial-offer's milestone_ref (index 1)
         // validates against the verification contract's milestone count.
         let validator = Address::generate(&env);
-        ver_client.register_validator(
-            &validator,
-            &String::from_str(&env, "UEFA-B-License"),
-            &String::from_str(&env, "Default Academy"),
-            &Vec::new(&env),
-        );
+        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA-B-License"), &String::from_str(&env, "Default Academy"), &String::from_str(&env, "Default Region"), &Vec::new(&env));
         ver_client.approve_milestone(
             &validator,
             &player_id,
@@ -4914,12 +4965,7 @@ mod tests {
         // Register a milestone so the trial-offer's milestone_ref (index 1)
         // validates against the verification contract's milestone count.
         let validator = Address::generate(&env);
-        ver_client.register_validator(
-            &validator,
-            &String::from_str(&env, "UEFA-B-License"),
-            &String::from_str(&env, "Default Academy"),
-            &Vec::new(&env),
-        );
+        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA-B-License"), &String::from_str(&env, "Default Academy"), &String::from_str(&env, "Default Region"), &Vec::new(&env));
         ver_client.approve_milestone(
             &validator,
             &player_id,

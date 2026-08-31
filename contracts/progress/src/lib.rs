@@ -330,6 +330,14 @@ impl ProgressContract {
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
 
         let old_level = Self::get_current_level(&env, player_id);
+        
+        // Validate that target_level < current_level (true rollback, not same-level or forward jump)
+        let old_code = Self::level_code(&old_level);
+        let target_code = Self::level_code(&target_level);
+        if target_code >= old_code {
+            return Err(ProgressError::InvalidProgressTransition);
+        }
+        
         Self::record_progress_entry(
             &env,
             player_id,
@@ -822,6 +830,18 @@ impl ProgressContract {
             .get(&DataKey::HistoryCounter(player_id))
             .unwrap_or(0u32);
 
+        // Read-side keep-alive (issue #1191): a player whose history is only
+        // ever read through the paginated getters must not have that history
+        // archived. Extend the counter so the read path itself keeps it alive,
+        // matching the write-side and `get_progress_history` behaviour.
+        if count > 0 {
+            env.storage().persistent().extend_ttl(
+                &DataKey::HistoryCounter(player_id),
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
+            );
+        }
+
         if offset >= count {
             return Vec::new(&env);
         }
@@ -832,11 +852,13 @@ impl ProgressContract {
 
         let mut entries: Vec<ProgressEntry> = Vec::new(&env);
         for i in start..=end {
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get(&DataKey::HistoryEntry(player_id, i))
-            {
+            let key = DataKey::HistoryEntry(player_id, i);
+            if let Some(entry) = env.storage().persistent().get(&key) {
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    PERSISTENT_TTL_MIN,
+                    PERSISTENT_TTL_MAX,
+                );
                 entries.push_back(entry);
             }
         }
@@ -1074,11 +1096,24 @@ mod tests {
         // for this logical cursor, even if advance_level is called concurrently.
         let snapshot_count: u32 = match cursor_snapshot {
             Some(s) => s,
-            None => env
-                .storage()
-                .persistent()
-                .get(&DataKey::HistoryCounter(player_id))
-                .unwrap_or(0u32),
+            None => {
+                let c: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::HistoryCounter(player_id))
+                    .unwrap_or(0u32);
+                // Read-side keep-alive (issue #1191): refresh the counter TTL on
+                // the first call of a cursor pass so history browsed only through
+                // this path isn't archived.
+                if c > 0 {
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::HistoryCounter(player_id),
+                        PERSISTENT_TTL_MIN,
+                        PERSISTENT_TTL_MAX,
+                    );
+                }
+                c
+            }
         };
 
         let next_index: u32 = cursor_next_index.unwrap_or(1);
@@ -1093,11 +1128,13 @@ mod tests {
 
         let mut entries: Vec<ProgressEntry> = Vec::new(&env);
         for i in next_index..=end {
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get(&DataKey::HistoryEntry(player_id, i))
-            {
+            let key = DataKey::HistoryEntry(player_id, i);
+            if let Some(entry) = env.storage().persistent().get(&key) {
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    PERSISTENT_TTL_MIN,
+                    PERSISTENT_TTL_MAX,
+                );
                 entries.push_back(entry);
             }
         }
@@ -1990,12 +2027,7 @@ mod tests {
         for player_id in [1u64, 2, 5, 7, 10, 20, 42, 55] {
             for _ in 0..2u32 {
                 let milestone_validator = Address::generate(&env);
-                ver_client.register_validator(
-                    &milestone_validator,
-                    &String::from_str(&env, "Test License"),
-                    &String::from_str(&env, "Test Academy"),
-                    &soroban_sdk::vec![&env],
-                );
+                ver_client.register_validator(&milestone_validator, &String::from_str(&env, "Test License"), &String::from_str(&env, "Test Academy"), &String::from_str(&env, "Default Region"), &soroban_sdk::vec![&env]);
                 for _ in 0..5 {
                     cid_seed += 1;
                     ver_client.approve_milestone(
@@ -2100,6 +2132,80 @@ mod tests {
         let entry = client.get_history_entry(&player_id, &1u32);
         assert_eq!(entry.old_level, ProgressLevel::Unverified);
         assert_eq!(entry.new_level, ProgressLevel::VerifiedIdentity);
+    }
+
+    // #1191: history read ONLY through get_progress_history_page must stay
+    // accessible across a long ledger span. The read path must extend the TTL
+    // of the HistoryCounter and every HistoryEntry it touches; otherwise the
+    // write-side extension decays and the history is archived while a UI is
+    // still actively browsing it.
+    #[test]
+    fn test_get_progress_history_page_keeps_history_alive() {
+        use soroban_sdk::testutils::Ledger;
+        let (env, client, validator) = setup();
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100_000;
+            l.min_persistent_entry_ttl = 500;
+            l.max_entry_ttl = 600_000;
+        });
+
+        // Write three history entries; each write extends TTL to
+        // 100_000 + PERSISTENT_TTL_MAX (= 618_400).
+        let player_id = 55u64;
+        client.advance_level(&validator, &player_id, &1u32);
+        client.advance_level(&validator, &player_id, &2u32);
+        client.advance_level(&validator, &player_id, &3u32);
+
+        // Move partway through the write-side TTL and read ONLY via the
+        // paginated getter — this must re-extend the history keys.
+        env.ledger().with_mut(|l| l.sequence_number = 500_000);
+        let page = client.get_progress_history_page(&player_id, &0u32, &50u32);
+        assert_eq!(page.len(), 3);
+
+        // Advance past the original write-side TTL (618_400). Without the
+        // read-side extension the counter/entries would now be archived.
+        env.ledger().with_mut(|l| l.sequence_number = 900_000);
+        let page = client.get_progress_history_page(&player_id, &0u32, &50u32);
+        assert_eq!(
+            page.len(),
+            3,
+            "history read only via the paginated getter must stay accessible"
+        );
+    }
+
+    // #1191: same keep-alive guarantee for the cursor-based paginated getter.
+    #[test]
+    fn test_get_history_page_with_cursor_keeps_history_alive() {
+        use soroban_sdk::testutils::Ledger;
+        let (env, client, validator) = setup();
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100_000;
+            l.min_persistent_entry_ttl = 500;
+            l.max_entry_ttl = 600_000;
+        });
+
+        let player_id = 55u64;
+        client.advance_level(&validator, &player_id, &1u32);
+        client.advance_level(&validator, &player_id, &2u32);
+        client.advance_level(&validator, &player_id, &3u32);
+
+        env.ledger().with_mut(|l| l.sequence_number = 500_000);
+        let (entries, _next, snapshot) =
+            client.get_history_page_with_cursor(&player_id, &None, &None, &50u32);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(snapshot, 3);
+
+        env.ledger().with_mut(|l| l.sequence_number = 900_000);
+        let (entries, _next, snapshot) =
+            client.get_history_page_with_cursor(&player_id, &None, &None, &50u32);
+        assert_eq!(
+            entries.len(),
+            3,
+            "cursor-paginated history must stay accessible across a long span"
+        );
+        assert_eq!(snapshot, 3);
     }
 
     // PlayerLevel TTL must be extended when reset_player_level writes it —
@@ -2559,12 +2665,7 @@ mod tests {
         let ver_admin = Address::generate(&env);
         ver_client.initialize(&ver_admin);
         let milestone_validator = Address::generate(&env);
-        ver_client.register_validator(
-            &milestone_validator,
-            &String::from_str(&env, "Test License"),
-            &String::from_str(&env, "Test Academy"),
-            &soroban_sdk::vec![&env],
-        );
+        ver_client.register_validator(&milestone_validator, &String::from_str(&env, "Test License"), &String::from_str(&env, "Test Academy"), &String::from_str(&env, "Default Region"), &soroban_sdk::vec![&env]);
         let player_id = 1u64;
         ver_client.approve_milestone(
             &milestone_validator,
@@ -2671,6 +2772,72 @@ mod tests {
         let (env, client, _) = setup();
         env.mock_auths(&[]);
         client.reset_player_level(&1u64, &ProgressLevel::Unverified);
+    }
+
+    #[test]
+    fn test_reset_player_level_rejects_same_level() {
+        let (_, client, validator) = setup();
+        let player_id = 1u64;
+
+        // Advance to level 2 (PerformanceMilestones)
+        client.advance_level(&validator, &player_id, &1u32);
+        client.advance_level(&validator, &player_id, &2u32);
+        assert_eq!(client.get_level(&player_id), ProgressLevel::PerformanceMilestones);
+
+        // Attempt to reset to the same level — should fail
+        let result = client.try_reset_player_level(&player_id, &ProgressLevel::PerformanceMilestones);
+        assert_eq!(result, Err(Ok(ProgressError::InvalidProgressTransition)));
+        
+        // Level should remain unchanged
+        assert_eq!(client.get_level(&player_id), ProgressLevel::PerformanceMilestones);
+        // History should have only the 2 advances, no reset entry
+        assert_eq!(client.get_history_count(&player_id), 2);
+    }
+
+    #[test]
+    fn test_reset_player_level_rejects_forward_jump() {
+        let (_, client, validator) = setup();
+        let player_id = 1u64;
+
+        // Advance to level 1 (VerifiedIdentity)
+        client.advance_level(&validator, &player_id, &1u32);
+        assert_eq!(client.get_level(&player_id), ProgressLevel::VerifiedIdentity);
+
+        // Attempt to reset forward to level 3 (EliteTier) — should fail
+        let result = client.try_reset_player_level(&player_id, &ProgressLevel::EliteTier);
+        assert_eq!(result, Err(Ok(ProgressError::InvalidProgressTransition)));
+        
+        // Level should remain at 1, not jump to 3
+        assert_eq!(client.get_level(&player_id), ProgressLevel::VerifiedIdentity);
+        // History should have only the 1 advance, no reset entry
+        assert_eq!(client.get_history_count(&player_id), 1);
+    }
+
+    #[test]
+    fn test_reset_player_level_allows_valid_rollback() {
+        let (_, client, validator) = setup();
+        let player_id = 1u64;
+
+        // Advance to level 3 (EliteTier)
+        client.advance_level(&validator, &player_id, &1u32);
+        client.advance_level(&validator, &player_id, &2u32);
+        client.advance_level(&validator, &player_id, &3u32);
+        assert_eq!(client.get_level(&player_id), ProgressLevel::EliteTier);
+        assert_eq!(client.get_history_count(&player_id), 3);
+
+        // Reset down to level 1 (VerifiedIdentity) — should succeed
+        let result = client.try_reset_player_level(&player_id, &ProgressLevel::VerifiedIdentity);
+        assert_eq!(result, Ok(Ok(())));
+        
+        // Level should now be 1
+        assert_eq!(client.get_level(&player_id), ProgressLevel::VerifiedIdentity);
+        // History should have 3 advances + 1 reset entry
+        assert_eq!(client.get_history_count(&player_id), 4);
+        
+        let reset_entry = client.get_history_entry(&player_id, &4u32);
+        assert_eq!(reset_entry.old_level, ProgressLevel::EliteTier);
+        assert_eq!(reset_entry.new_level, ProgressLevel::VerifiedIdentity);
+        assert_eq!(reset_entry.milestone_ref, 0);
     }
 
     #[test]
@@ -2783,12 +2950,7 @@ mod tests {
         prog_client.set_scout_access_contract(&scout_access);
 
         let validator = Address::generate(&env);
-        ver_client.register_validator(
-            &validator,
-            &soroban_sdk::String::from_str(&env, "UEFA-B-License"),
-            &soroban_sdk::String::from_str(&env, "Test Academy"),
-            &soroban_sdk::vec![&env],
-        );
+        ver_client.register_validator(&validator, &soroban_sdk::String::from_str(&env, "UEFA-B-License"), &soroban_sdk::String::from_str(&env, "Test Academy"), &String::from_str(&env, "Default Region"), &soroban_sdk::vec![&env]);
         // Approve one milestone for player 1 → milestone_ref 1 is valid.
         ver_client.approve_milestone(
             &validator,

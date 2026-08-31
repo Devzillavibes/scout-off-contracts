@@ -91,6 +91,42 @@ history checks.
 
 ---
 
+## Evidence Access Grant
+
+An append-only on-chain record (`EvidenceAccessGrant`) that a scout paid to
+contact a specific player, and is therefore entitled to request that player's
+off-chain evidence key-wrap from the key-wrapping service. The grant captures
+the scout, the player, the ledger time it was issued, and the scout's
+subscription tier **at the moment of the grant** — it is a historical fact
+about a paid contact, not a live re-derivation of the scout's current
+entitlement.
+
+One grant is written per successful `(player_id, scout)` contact, atomically
+with the contact-fee transfer and `ContactRecord` write, on every successful
+`pay_to_contact` (and each newly recorded contact in `batch_contact_players`).
+It is unreachable on any rejected call, because it runs after every
+subscription-tier, quota, and payment guard has passed.
+
+A grant is **append-only and is not auto-revoked** by a subscription lapse,
+downgrade, or expiry — those code paths never touch grant state, so a scout who
+paid while subscribed keeps access even after downgrading. The only way to
+revoke is the explicit, admin-gated `admin_revoke_evidence_access`, which sets
+`revoked = true` / `revoked_at` but never deletes the record (the audit trail
+stays intact) and is idempotent. Revocation only gates *future* key-wrap
+requests; it cannot claw back a key already delivered off-chain.
+
+- Relevant functions: `has_evidence_access`, `get_evidence_access_grant`,
+  `get_player_access_grants`, `admin_revoke_evidence_access` (grant is written
+  by `pay_to_contact` / `batch_contact_players`) — see
+  [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md#scout_access).
+- Relevant events: `evidence_access_granted`, `evidence_access_revoked`.
+- Full design and append-only rationale:
+  [EVIDENCE_PRIVACY.md](EVIDENCE_PRIVACY.md).
+- Related: [ContactRecord](#contactrecord),
+  [Subscription Tier](#subscription-tier).
+
+---
+
 ## FeeConfig
 
 The primary configuration struct for the `scout_access` contract. Controls all
@@ -265,7 +301,7 @@ only) log trial offers that a player can confirm to reach Level 3.
 
 - Relevant functions: `register_scout`, `subscribe`, `pay_to_contact`,
   `log_trial_offer` — see
-  [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md#registration).
+  [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md#scout_access).
 
 ---
 

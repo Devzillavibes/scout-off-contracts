@@ -120,7 +120,7 @@ Progress levels are configured per player and enforced on-chain by authorized va
 
 ### Validator Functions
 
-- `approve_milestone(player_id, milestone, evidence_hash)` — Confirm a player achievement and trigger progress update (validator auth required)
+- `approve_milestone(validator_wallet, player_id, description, evidence_hash, milestone_category: Option<String>)` — Confirm a player achievement and trigger progress update (validator auth required). When `milestone_category` is supplied it must match one of the calling validator's specialization tags, otherwise the call is rejected with `SpecializationMismatch`.
 - `register_validator(wallet, credentials, affiliation, specializations)` — Onboard a new coach, academy, or trainer as an authorized validator (admin auth required). `affiliation` is the canonical organization identifier used for diversity gating, while `specializations` is the optional list of category tags (for example `"physical-stats"` or `"identity-kyc"`) that gate milestone approval when `milestone_category` is set.
 - `revoke_validator(wallet)` — Remove a validator from the trusted registry (admin auth required)
 
@@ -358,8 +358,9 @@ cp .env.example .env
 
 ```bash
 ./scripts/initialize.sh testnet
-# Initializes all four contracts and wires the verification → progress
-# cross-contract link so approve_milestone advances levels atomically
+# Initializes all four contracts and establishes all eight cross-contract
+# wiring links (see "Cross-Contract Wiring" below) so approve_milestone and
+# confirm_trial_offer advance levels atomically
 ```
 
 #### 5. Generate TypeScript bindings
@@ -381,7 +382,20 @@ cp .env.example .env
 
 ## Cross-Contract Wiring
 
-`approve_milestone` in the verification contract cross-calls `advance_level` in the progress contract atomically — both state changes happen in the same Stellar transaction. This is wired up by `initialize.sh` automatically:
+The four contracts hold **eight** peer-address pointers between them. `initialize.sh` establishes all eight automatically, and `./scripts/verify-cross-contract-wiring.sh <network>` checks them. The canonical list is in [`docs/WIRING_REGISTRY_DESIGN.md`](docs/WIRING_REGISTRY_DESIGN.md); `ai.md` carries the same table with the exact `stellar contract invoke` commands.
+
+| # | Link | Purpose |
+|---|------|---------|
+| 1 | `verification` → `progress` | `approve_milestone` calls `advance_level` |
+| 2 | `verification` → `registration` | dispute-milestone wallet-to-`player_id` binding check |
+| 3 | `registration` → `progress` | `filter_players` resolves player levels at query time |
+| 4 | `progress` → `verification` | whitelists verification as an `advance_level` caller |
+| 5 | `progress` → `registration` | `progress` calls `set_player_level` on registration |
+| 6 | `progress` → `scout_access` | whitelists scout_access as an `advance_level` caller |
+| 7 | `scout_access` → `progress` | `confirm_trial_offer` calls `advance_level` for Level 3 |
+| 8 | `scout_access` → `registration` | Pro-tier scout verification / Sybil gating lookups |
+
+For example, the verification → progress link:
 
 ```bash
 stellar contract invoke \
@@ -390,7 +404,7 @@ stellar contract invoke \
   --progress_contract $PROGRESS_CONTRACT_ID
 ```
 
-Without this step, milestones are recorded but player levels do not advance.
+Without the full wiring, milestones and trial offers are recorded but player levels do not advance.
 
 ## TypeScript Bindings
 
@@ -528,36 +542,46 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Contract test coverage:
+Rather than maintaining a hand-curated checklist here, refer directly to the test suites in each contract's source tree. Each directory contains the full, up-to-date coverage picture:
 
-- ✅ Player registration, duplicate prevention, profile updates
-- ✅ Scout registration
-- ✅ Validator registration, revocation, and active state checks
-- ✅ Milestone approval — happy path, multiple milestones per player
-- ✅ Revoked validator cannot approve milestones
-- ✅ Unregistered validator cannot approve milestones
-- ✅ Progress level sequence (Unverified → VerifiedIdentity → PerformanceMilestones → EliteTier)
-- ✅ Cannot exceed EliteTier
-- ✅ Progress history entries recorded per level change
-- ✅ Scout subscription — Basic, Pro, Elite tiers with XLM fee settlement
-- ✅ Pay-to-contact with active subscription
-- ✅ Duplicate contact prevention
-- ✅ Contact without subscription fails
-- ✅ Subscription expiry enforcement
-- ✅ Trial offer logging (Elite only)
-- ✅ Trial offer rejected for non-Elite tier
-- ✅ Fee accumulation and admin withdrawal
-- ✅ Pause / unpause circuit breaker
+| Directory | What it covers |
+|-----------|----------------|
+| `contracts/registration/src/lib.rs` (inline tests) | Player registration, scout registration, duplicate prevention, profile updates, admin initialization, field-validation guards |
+| `contracts/verification/src/lib.rs` (inline tests) | Validator registry CRUD, milestone approval happy path, revoked/unregistered validator guards, evidence-hash storage, validator-cap enforcement |
+| `contracts/progress/src/lib.rs` (inline tests) | Four-tier level state machine (Unverified → VerifiedIdentity → PerformanceMilestones → EliteTier), invalid-transition rejection, progress history recording, dispute-resolution level reset |
+| `contracts/scout_access/src/lib.rs` (inline tests) | Scout subscriptions (Basic / Pro / Elite) with XLM fee settlement, pay-to-contact flow, duplicate-contact prevention, subscription-expiry enforcement, trial offer logging (Elite only), trial offer rejection for non-Elite, fee accumulation and admin withdrawal, pause / unpause circuit breaker, subscription downgrade guard, auto-renewal logic |
+| `contracts/scout_access/tests/` | Integration tests for the full trial-offer flow across contract boundaries |
+| `tests/` | Cross-contract event emission tests |
+
+> **Note:** The workspace has known compile-blockers tracked in the "get the workspace green" umbrella issue. Test items that depend on features not yet merged should be treated as **not currently running** until that issue is resolved. Do not rely on this README as a statement of passing coverage — run `cargo test --workspace` and inspect the output directly.
 
 ## MVP Scope
 
-The initial testnet MVP focuses on a single end-to-end flow:
+The contracts shipped on testnet cover the following capabilities. This section reflects what is **currently implemented** in the contract source. It aligns with the Features list above and the checked items in the Roadmap below.
 
-1. One player registers a profile → contract stores identity and IPFS links at Level 0
-2. One validator approves a milestone → progress updates to Level 1 or 2 on-chain
-3. One scout pays to contact the player → fee settles in XLM, contact details unlocked
+### Shipped contract features
 
-Secondary features (fractionalized sponsorship, oracle integrations, advanced filtering) ship in subsequent milestones.
+- **Player & scout registration** — on-chain identity, IPFS hash storage, duplicate prevention, field validation
+- **Validator registry** — admin-controlled register / revoke lifecycle, credential storage, validator-cap enforcement
+- **Four-tier progress levels** — Unverified → VerifiedIdentity → PerformanceMilestones → EliteTier state machine with immutable on-chain history
+- **Milestone approval** — validators confirm achievements with on-chain evidence hashes; cross-contract call atomically advances player level
+- **Scout subscriptions** — Basic / Pro / Elite tiers with XLM fee settlement, expiry enforcement, downgrade guard, and auto-renewal
+- **Pay-to-contact** — scouts pay a micro-fee to unlock contact details; duplicate-contact prevention; fee accumulation
+- **Trial offer logging** — Elite-tier scouts record trial offers on-chain, advancing the player to Level 3 (EliteTier)
+- **Admin controls** — fee-config management, fee withdrawal, and a contract-level circuit breaker (pause / unpause) on all four contracts
+- **Event emission** — structured events for off-chain indexing on every state-changing operation
+- **Deployment tooling** — build, deploy, initialize, cross-contract wiring, TypeScript binding generation, and one-command testnet setup
+- **Backend schema** — PostgreSQL migration for the event-indexer backend
+
+### Not yet started (future milestones)
+
+The following are tracked in the Roadmap but have **no contract code today**:
+
+- Fractionalized Player Token sponsorship model
+- Decentralized oracle integration for physical stats
+- Mobile-first Flutter frontend
+- Security audit
+- Mainnet launch
 
 ## Roadmap
 

@@ -347,3 +347,15 @@ pub fn evidence_access_revoked(env: &Env, player_id: u64, scout: &Address, admin
         (player_id, admin.clone()),
     );
 }
+
+pub const REGIONAL_CONTACT_LIMIT_SET: &str = "regional_contact_limit_set";
+
+/// topics: (event_name, admin)  data: (region, limit)
+///
+/// Emitted when an admin sets or updates a per-region Pro-tier contact limit override.
+pub fn regional_contact_limit_set(env: &Env, admin: &Address, region: &soroban_sdk::String, limit: u32) {
+    env.events().publish(
+        (Symbol::new(env, REGIONAL_CONTACT_LIMIT_SET), admin.clone()),
+        (region.clone(), limit),
+    );
+}

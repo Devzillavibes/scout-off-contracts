@@ -74,7 +74,7 @@ const PERSISTENT_TTL_MAX: u32 = 518_400;
 const ADMIN_BUMP_LEDGERS: u32 = 518_400;
 
 /// Default registration cooldown: 24 hours in seconds.
-/// Applies to register_player, register_scout, and register_validator.
+/// Applies to register_player, register_scout, andregister_validator.
 /// Configurable by admin via `set_reg_cooldown`.  0 disables the cooldown.
 const DEFAULT_REG_COOLDOWN_SECS: u64 = 86_400;
 
@@ -1503,6 +1503,19 @@ mod tests {
                         continue;
                     }
                     if let Ok(profile) = Self::load_player(&env, player_id) {
+                        // The composite index is only a performance hint, never a
+                        // trusted source. Re-validate the loaded profile against the
+                        // filter so a stale or corrupted bucket entry — from a
+                        // deregister_player leak, a set_player_level level/region
+                        // mismatch, or a restored-but-not-reindexed player — cannot
+                        // leak a non-matching player into the results. This mirrors
+                        // the level_gte re-check the slow path already performs.
+                        if !Self::level_gte(&profile.level, &min_level) {
+                            continue;
+                        }
+                        if profile.vitals.region != region {
+                            continue;
+                        }
                         if position_filter && profile.vitals.position != position {
                             continue;
                         }
@@ -3697,12 +3710,7 @@ mod tests {
 
         // 9. Register validator in verification contract
         let validator = Address::generate(&env);
-        ver_client.register_validator(
-            &validator,
-            &String::from_str(&env, "UEFA B License"),
-            &String::from_str(&env, "Default Academy"),
-            &Vec::new(&env),
-        );
+        ver_client.register_validator(&validator, &String::from_str(&env, "UEFA B License"), &String::from_str(&env, "Default Academy"), &String::from_str(&env, "Default Region"), &Vec::new(&env));
 
         // 10. Approve milestone via verification contract (this triggers the cross-contract flow)
         ver_client.approve_milestone(

@@ -707,6 +707,29 @@ stellar contract invoke --id $NEW_REGISTRATION_CONTRACT_ID \
 A single wallet may register as both a player and a scout. Cross-role
 registration is permitted; duplicate prevention is enforced per role only.
 
+### ScoutChainError Codes
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 1 | `AlreadyInitialized` | Contract has already been initialized |
+| 2 | `NotInitialized` | Contract has not been initialized yet |
+| 3 | `PlayerNotFound` | Player ID does not exist |
+| 4 | `ValidatorNotAuthorized` | Caller is not a registered and active validator |
+| 5 | `InvalidProgressTransition` | Requested level transition is not allowed |
+| 6 | `ScoutNotSubscribed` | Scout does not have an active subscription |
+| 7 | `InsufficientFee` | Payment amount is below the required fee |
+| 8 | `AlreadyRegistered` | Wallet already has a registered profile |
+| 9 | `ContractPaused` | Contract is paused by the emergency circuit breaker |
+| 10 | `Unauthorized` | Caller is not authorized for the requested operation |
+| 11 | `Overflow` | Arithmetic overflow in fee calculation |
+| 12 | `ScoutNotFound` | Scout ID does not exist |
+| 13 | `InvalidInput` | One or more input parameters are invalid |
+| 14 | `ValidatorCapReached` | Maximum number of registered validators has been reached |
+| 15 | `PlayerCapReached` | Maximum number of registered players has been reached |
+| 16 | `RegistrationCooldown` | Registration attempted before the cooldown period has elapsed |
+| 17 | `PlayerRecordEvicted` | Player record was evicted from contract storage |
+| 18 | `ScoutRecordEvicted` | Scout record was evicted from contract storage |
+
 ---
 
 ## verification
@@ -1902,10 +1925,11 @@ always reflects exactly the set of open disputes with no full-scan required at
 query time — making it possible to build an admin "disputes needing attention"
 dashboard from on-chain queries alone.
 
-- `limit` is capped at **50** per page, consistent with `get_global_milestone_index`
-  and `get_validator_milestones_page`.
+- `limit` is capped at **50** per page (minimum 1), consistent with
+  `get_global_milestone_index` and `get_validator_milestones_page`.
 - `offset` is a zero-based item offset (e.g. `offset=0, limit=50` → first page;
-  `offset=50, limit=50` → second page).
+  `offset=50, limit=50` → second page). If `offset >= total`, an empty list is
+  returned immediately without iterating the index.
 - Entries are returned **oldest-first** (insertion order).
 - The index tracks **only unresolved disputes** — resolved disputes are removed
   immediately, so the index stays naturally bounded in size.
@@ -1933,10 +1957,13 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 #### `get_global_milestone_index(offset: u32, limit: u32) -> GlobalMilestoneIndexPage`
 
 Return a page of the global milestone index — a rolling log of the most
-recent `(player_id, milestone_index)` pairs across all players and
-validators (capped at 500 entries; oldest entries are evicted first).
-`limit` is capped at 50 entries per page. `GlobalMilestoneIndexPage` has
-`entries: Vec<GlobalMilestoneEntry>` and `total: u32`.
+recent `(player_id, milestone_index)` pairs across all players and validators
+(capped at 500 entries; oldest entries are evicted first). `limit` is capped
+at 50 entries per page (minimum 1). `GlobalMilestoneIndexPage` has `entries:
+Vec<GlobalMilestoneEntry>` and `total: u32`.
+
+If `offset >= total`, `entries` is empty and `total` still reflects the full
+index length — safe to use for pagination bounds checks.
 
 | | |
 |---|---|
@@ -1946,6 +1973,34 @@ validators (capped at 500 entries; oldest entries are evicted first).
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
   -- get_global_milestone_index --offset 0 --limit 50
+```
+
+---
+
+#### `get_milestones_since_page(player_id: u64, since_timestamp: u64, offset: u32, limit: u32) -> Vec<Milestone>`
+
+Return a bounded page of milestones for `player_id` that were approved at or
+after `since_timestamp` (Unix seconds). This is the bounded replacement for
+an unbounded time-range scan.
+
+**Pagination contract:**
+- `limit` is capped at **50** per page (minimum 1).
+- `offset` is bounded against the player's milestone count: if `offset >=
+  count`, an empty list is returned immediately without iterating.
+- Results are returned in approval order (oldest first within the page).
+- Callers who want all milestones without a time filter should use
+  `get_milestone_count` + `get_milestone` directly.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+# Milestones for player 1 approved after a given Unix timestamp
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- get_milestones_since_page --player_id 1 --since_timestamp 1700000000 \
+     --offset 0 --limit 50
 ```
 
 ---
@@ -2905,6 +2960,26 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID -- version
 | `contract_paused` | event_name, admin (Address) | () | Circuit breaker engaged |
 | `contract_unpaused` | event_name, admin (Address) | () | Circuit breaker released |
 
+### ProgressError Codes
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 1 | `AlreadyInitialized` | Contract has already been initialized |
+| 2 | `NotInitialized` | Contract has not been initialized yet |
+| 3 | `ContractPaused` | Contract is paused by the emergency circuit breaker |
+| 4 | `Unauthorized` | Caller is not authorized for the requested operation |
+| 5 | `InvalidProgressTransition` | Requested level transition is not allowed |
+| 6 | `AlreadyAtMaxLevel` | Player is already at the maximum progress level (EliteTier) |
+| 7 | `PlayerNotFound` | Player ID does not exist in progress storage |
+| 8 | `HistoryNotFound` | Progress history record does not exist for this player |
+| 9 | `InvalidHistoryEntry` | History entry data is malformed or inconsistent |
+| 10 | `ProgressRecordEvicted` | Progress record was evicted from contract storage |
+| 11 | `MigrationNotActive` | Migration operation attempted when no migration is in progress |
+| 12 | `HistoryAlreadyExists` | History entry for this level already exists for the player |
+| 13 | `MerkleRootMismatch` | Provided Merkle root does not match the stored root |
+| 14 | `InvalidHistoryIndex` | Requested history index is out of bounds |
+| 15 | `PlayerLevelRecordEvicted` | Player level record was evicted from contract storage |
+
 ---
 
 ## scout_access
@@ -2944,6 +3019,12 @@ greater than zero; either function returns `InvalidInput` otherwise.
   `ProContactLimitReached` (code 20) for that scout until their subscription
   renews. **Elite-tier scouts are exempt** from this limit and may contact any
   number of players regardless of `pro_contact_limit`.
+
+  > **Per-region overrides**: admins may configure a different limit for scouts
+  > in specific regions using `set_regional_contact_limit(region, limit)`. When
+  > set, the regional value takes precedence over this platform-wide default for
+  > scouts whose registered `region` matches. See the
+  > `set_regional_contact_limit` function reference below for details.
 - `trial_offer_escrow_stroops` must be > 0 (zero or negative → `InvalidInput`). This is the XLM amount held in escrow when a scout logs a trial offer.
 - `trial_offer_expiry_secs` must be > 0 (zero → `InvalidInput`). This defines the window within which a player must confirm a trial offer before it expires and the escrow is refunded.
 - There is no enforced upper bound on fee fields, but values larger than the XLM supply
@@ -2996,6 +3077,48 @@ Written exactly once, atomically, by a successful `pay_to_contact` or
 > This lightweight on-chain trail lets you read the immediately-previous fee configuration without depending on the off-chain indexer, making it suitable for quick audits or on-chain fee-change verification. For a *complete*, unbounded audit trail — including all historical fee rates for verifying that a contact fee or subscription payment matched the rate in effect at that time — replay the `fee_config_updated` event logs via the off-chain indexer's `fee_config_history` table (see [001_initial_schema.sql](migrations/001_initial_schema.sql#L135-L148)).
 
 ### Functions
+
+### ScoutAccessError Codes
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 1 | `AlreadyInitialized` | Contract has already been initialized |
+| 2 | `NotInitialized` | Contract has not been initialized yet |
+| 3 | `ContractPaused` | Contract is paused by admin (circuit breaker) |
+| 4 | `Unauthorized` | Caller is not authorized for this operation |
+| 5 | `InsufficientFee` | Payment amount is below the required fee |
+| 6 | `ScoutNotSubscribed` | Scout does not have an active subscription |
+| 7 | `SubscriptionExpired` | Scout's subscription has expired |
+| 8 | `AlreadyContacted` | Scout has already contacted this player |
+| 9 | `InvalidTier` | Subscription tier value is not valid |
+| 10 | `Overflow` | Arithmetic overflow in fee calculation |
+| 11 | `TrialOfferNotFound` | Trial offer record does not exist |
+| 12 | `PlayerNotRegistered` | Player is not registered in the registration contract |
+| 13 | `ScoutNotRegistered` | Scout is not registered in the registration contract |
+| 14 | `PlayerCapReached` | Maximum number of players per scout has been reached |
+| 15 | `SubscriptionNotFound` | Subscription record not found for this scout |
+| 16 | `ContactRecordNotFound` | Contact record not found |
+| 17 | `TrialOfferExpired` | Trial offer has passed its expiry ledger |
+| 18 | `InvalidSubscriptionDuration` | Subscription duration value is not valid |
+| 19 | `FeeConfigNotFound` | Fee configuration has not been set |
+| 20 | `TokenTransferFailed` | XLM or platform token transfer failed |
+| 21 | `InvalidContactFee` | Contact fee value is not valid |
+| 22 | `InvalidSubFee` | Subscription fee value is not valid |
+| 23 | `EliteOnlyFeature` | Operation requires an Elite-tier subscription |
+| 24 | `MigrationAlreadyComplete` | Migration has already been completed |
+| 25 | `MigrationNotFound` | Migration record does not exist |
+| 26 | `InvalidMigrationVersion` | Migration version number is not valid |
+| 27 | `MigrationDataCorrupted` | Migration data failed integrity check |
+| 28 | `MigrationStateMismatch` | Migration state does not match expected state |
+| 29 | `MigrationNotActive` | Migration is not currently active |
+| 30 | `MigrationReplayDetected` | Migration replay attempt detected |
+| 31 | `MigrationConflict` | Migration conflicts with existing state |
+| 32 | `MigrationVersionMismatch` | Migration version does not match current contract version |
+| 33 | `MigrationChecksumFailed` | Migration checksum verification failed |
+| 34 | `MigrationRollbackFailed` | Migration rollback could not be completed |
+| 35 | `SubscriptionRecordEvicted` | Subscription record was evicted from contract storage |
+| 36 | `PayToContactPaused` | Pay-to-contact feature is currently paused |
+| 37 | `TrialEscrowNotOutstanding` | No outstanding trial escrow exists for this player |
 
 ---
 
@@ -3384,6 +3507,55 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
   -- refund_subscription \
   --scout $SCOUT_ADDRESS \
   --amount 1000000
+```
+
+---
+
+#### `set_regional_contact_limit(region: String, limit: u32) -> Result<(), ScoutAccessError>`
+
+Set or update a per-region Pro-tier contact limit override.
+
+When a Pro-tier scout calls `pay_to_contact` or `batch_contact_players`, the
+quota check first looks for a regional override keyed by the scout's registered
+`region` (from the registration contract). If an override exists it is used
+**instead of** `FeeConfig.pro_contact_limit`. If no override exists the
+platform-wide default applies (backward-compatible fallback).
+
+Override storage is bounded (one `u32` per region string) and admin-managed
+only — scouts cannot alter their own quota.
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `Unauthorized` · `InvalidInput` (limit = 0) |
+| **Emits** | `regional_contact_limit_set` with `(admin, region, limit)` |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- set_regional_contact_limit \
+  --region "North America" \
+  --limit 20
+```
+
+---
+
+#### `remove_regional_contact_limit(region: String) -> Result<(), ScoutAccessError>`
+
+Remove a previously-set per-region Pro-tier contact limit override.
+
+After removal, scouts in that region fall back to the platform-wide
+`FeeConfig.pro_contact_limit`. No-ops silently if no override existed for the
+given region.
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `Unauthorized` |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- remove_regional_contact_limit \
+  --region "North America"
 ```
 
 ---
@@ -3900,6 +4072,29 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID -- get_fee_config_history
 
 ---
 
+#### `get_regional_contact_limit(region: String) -> u32`
+
+Return the effective Pro-tier contact limit for the given `region`.
+
+If a per-region override has been set via `set_regional_contact_limit`, that
+value is returned. Otherwise the platform-wide `FeeConfig.pro_contact_limit`
+is returned as the fallback. This is the same value the quota check inside
+`pay_to_contact` and `batch_contact_players` uses for scouts registered in
+that region.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- get_regional_contact_limit \
+  --region "North America"
+```
+
+---
+
 #### `get_accumulated_fees() -> i128`
 
 Return total platform fees pending admin withdrawal (in stroops).
@@ -4275,7 +4470,10 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
 Return subscriptions whose `expires_at` is at or before `before_timestamp`.
 This query uses a day-granularity expiry bucket index to avoid scanning every
 subscription, and it filters renewals by re-checking the live stored
-`Subscription.expires_at`.
+`Subscription.expires_at`. The bucket scan starts at the earliest populated
+bucket day (`DataKey::MinExpiryBucketDay`, tracked by `subscribe`/seeding), so
+its cost tracks the number of populated expiry days in range rather than the
+number of days elapsed since the epoch.
 
 | | |
 |---|---|
@@ -4763,20 +4961,31 @@ pub struct TrialOffer {
 | 16 | `DuplicateEvidence` | Evidence hash has already been used in a prior `approve_milestone` call |
 | 17 | `MilestoneLimitExceeded` | Validator has already approved 5 milestones for this player |
 | 18 | `DisputeAlreadyResolved` | Dispute was already resolved and cannot be resolved again |
-| 19 | `PendingAdminNotSet` | `accept_admin` called without a pending proposal |
-| 20 | `ApproveMilestonePaused` | `approve_milestone` function is independently paused |
-| 21 | `InvalidAttestation` | The provided attestation signature is invalid or does not match the expected issuer |
-| 22 | `UntrustedIssuer` | The attestation issuer is not registered in the trusted issuer registry |
-| 23 | `CredentialExpired` | The credential claim has expired |
-| 24 | `IssuerCapReached` | The issuer registry limit (20) has been reached; contract upgrade required to raise the cap |
-| 25 | `IssuerAlreadyRegistered` | The issuer is already registered |
-| 26 | `IssuerNotFound` | The issuer was not found in the registry |
+| 19 | `PendingAdminNotSet` | `accept_admin` called before an admin transfer was proposed |
 | 20 | `ApproveMilestonePaused` | `approve_milestone` is paused independently of the whole-contract pause |
-| 21 | `SpecializationMismatch` | `milestone_category` supplied to `approve_milestone` but validator is not tagged for that category |
-| 26 | `DuplicateAttestation` | Same active validator attested to the same claim within its current voting round |
-| 27 | `TooManyPendingVotes` | Validator already has `MAX_PENDING_VOTES_PER_VALIDATOR` (25) concurrent open votes |
-| 28 | `ThresholdModeRequiresAttestation` | `approve_milestone` called while `get_milestone_threshold() > 1` — use `attest_milestone` |
-| 29 | `RegistrationCallFailed` | Cross-contract call to registration contract failed when verifying dispute-milestone wallet-to-player-id binding |
+| 21 | `SpecializationMismatch` | `milestone_category` supplied to `approve_milestone` but the validator is not tagged for that category |
+| 22 | `InvalidAttestation` | ed25519 signature over the attestation payload failed, or its contract/network binding does not match this instance |
+| 23 | `AttestationKeyNotFound` | No attestation public key has been registered for this validator |
+| 24 | `InvalidNonce` | Attestation nonce is not strictly greater than the last accepted nonce |
+| 25 | `RegistrationCooldown` | Validator registration attempted before the cooldown window elapsed |
+| 26 | `DuplicateAttestation` | Same active validator attested to the same `(player_id, evidence_hash)` claim within its current voting round |
+| 27 | `TooManyPendingVotes` | Validator already has `MAX_PENDING_VOTES_PER_VALIDATOR` concurrent open attestation votes |
+| 28 | `ThresholdModeRequiresAttestation` | `approve_milestone` / `submit_attested_milestone` called while `get_milestone_threshold() > 1` — use `attest_milestone` |
+| 29 | `RegistrationCallFailed` | Cross-contract call to the registration contract failed |
+| 30 | `MigrationNotActive` | Migration window is not currently active; call `open_migration_window` first |
+| 31 | `MilestoneAlreadyExists` | A `Milestone` already exists at `(player_id, milestone_index)` with different content |
+| 32 | `DisputeAlreadyExists` | A `MilestoneDispute` already exists at `(player_id, milestone_index)` with different content |
+| 33 | `ValidatorRecordEvicted` | `restore_validator_record` targeted a validator entry whose archival grace period has fully elapsed |
+| 34 | `MilestoneRecordEvicted` | `restore_milestone_record` targeted a milestone entry that has been fully evicted |
+| 35 | `NotEligibleToReReview` | `rereview_milestone` called by a wallet that is not a currently-active validator |
+| 36 | `MilestoneNotFlagged` | `rereview_milestone` called on a milestone not currently flagged as pending re-review |
+| 37 | `DisputeRequiresJury` | `resolve_dispute` called on a dispute that requires jury resolution — use `tally_dispute` |
+| 38 | `NotJuryDispute` | `cast_dispute_vote` / `tally_dispute` called on a dispute not routed to the jury path |
+| 39 | `VotingWindowClosed` | `cast_dispute_vote` called after the voting window has closed |
+| 40 | `ConflictOfInterest` | `cast_dispute_vote` called by the validator who approved the disputed milestone |
+| 41 | `AlreadyVoted` | `cast_dispute_vote` called by a validator who has already voted on this dispute |
+| 42 | `VotingWindowOpen` | `tally_dispute` called before the window closes with votes tied at or above quorum |
+| 43 | `QuorumNotReached` | `tally_dispute` called before the window closes and quorum not yet reached |
 
 ### `ProgressError` (progress contract)
 
@@ -4863,8 +5072,6 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `validator_revoked` | event_name, admin (Address) | wallet (Address), reason (String) | Validator deactivated |
 | `validator_restored` | event_name, admin (Address) | wallet (Address) | Revoked validator re-activated |
 | `validator_transferred` | event_name, admin (Address) | old_wallet (Address), new_wallet (Address) | Validator identity migrated to new wallet |
-| `issuer_registered` | event_name, issuer_wallet (Address) | issuer_name (String) | New trusted credential issuer onboarded |
-| `issuer_revoked` | event_name, issuer_wallet (Address) | issuer_wallet (Address) | Trusted credential issuer deactivated |
 | `milestone_disputed` | event_name, player_wallet (Address) | player_id (u64), milestone_index (u32), reason (String) | Player disputes a milestone attribution |
 | `dispute_resolved` | event_name, admin (Address) | player_id (u64), milestone_index (u32), upheld (bool) | Admin resolves a milestone dispute |
 | `progress_contract_updated` | event_name, admin (Address) | progress_contract (Address) | Progress contract address re-wired |
