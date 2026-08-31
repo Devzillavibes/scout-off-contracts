@@ -43,6 +43,17 @@ scout opts in via `set_auto_renew(scout, enabled)` (emitting the
 or the scout — can call `renew_if_due(scout)` when the subscription is due,
 emitting `subscription_auto_renewed` on success.
 
+Each renewal anchors the new `expires_at` to
+`max(old_expires_at, now) + sub_duration_secs` rather than
+`now + sub_duration_secs`, so consecutive on-time-ish renewals produce
+contiguous non-overlapping periods. The same anchored `expires_at` defines
+the `pro_contact_limit` period boundary, keeping that reset aligned with the
+coverage period. Renewals are due within the
+`renewal_window_secs = sub_duration_secs / 10` grace window (3 days for the
+30-day default); the window is floored at 1 second, so the minimum sensible
+`sub_duration_secs` is 10 seconds (any shorter duration makes the computed
+window 0 and relies on the clamp).
+
 If auto-renewal is not enabled for a scout, `renew_if_due` returns the
 `AutoRenewNotEnabled` error (`ScoutAccessError` code 28).
 
