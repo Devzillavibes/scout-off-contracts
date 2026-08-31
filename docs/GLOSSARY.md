@@ -179,6 +179,26 @@ window the confirmation path refunds the scout's escrow and emits
 
 ---
 
+## Migration Window
+
+An admin-toggled instance flag on each contract that gates all `admin_seed_*` state-seeding functions. When the migration window is open (`migration_window_is_open` returns `true`), operators may call the seeding entrypoints to replay exported state onto a freshly deployed contract without requiring the original wallet signatures. When the window is closed, all `admin_seed_*` calls are rejected with `MigrationNotActive`.
+
+The window is opened with `open_migration_window` and closed with `close_migration_window` (both admin-only). It should be kept open only for the duration of a controlled replay, then closed before the new contract begins serving real traffic.
+
+Affected seeding functions (present on all four contracts):
+
+- `registration`: `admin_seed_player`, `admin_seed_scout`
+- `verification`: `admin_seed_validator`, `admin_seed_milestone`
+- `progress`: `admin_seed_history`
+- `scout_access`: `admin_seed_subscription`, `admin_seed_contact`
+
+Tooling: `scripts/replay-state.sh` opens the window, seeds all replayable data categories, then closes it. `scripts/migrate-contract.sh` orchestrates the full migration including this step.
+
+- See [docs/MIGRATION_GAPS.md](MIGRATION_GAPS.md) for the canonical list of which data categories are fully, partially, or not replayable.
+- See [docs/DEPLOYMENT.md — Address migration](DEPLOYMENT.md#address-migration-new-contract-id) for the step-by-step migration procedure.
+
+---
+
 ## Milestone
 
 A verified player achievement recorded on-chain by an authorised validator.
