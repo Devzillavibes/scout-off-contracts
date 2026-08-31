@@ -440,10 +440,13 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 12 | `ScoutNotFound` | Invalid `scout_id` |
 | 13 | `InvalidInput` | Field too long, bad hash count, or empty value |
 | 14 | `PendingAdminNotSet` | `accept_admin` called without a prior `propose_admin` |
-| 15 | `PlayerCapReached` | Player registration cap reached — a hard stop, not retryable |
-| 16 | `RegistrationCooldown` | Caller registered again before the cooldown elapsed — retryable |
-| 17 | `PlayerRecordEvicted` | `restore_player_record` targeted a fully evicted, unrecoverable player entry |
-| 18 | `ScoutRecordEvicted` | `restore_scout_record` targeted a fully evicted, unrecoverable scout entry |
+| 15 | `PlayerCapReached` | Player registration cap reached |
+| 16 | `RegistrationCooldown` | Caller attempted to register again before cooldown |
+
+> **Note:** `RegistrationCooldown` (code 16) differs from the same-named code in the verification contract (code 25, see below). Always check which contract returned the error.
+
+| 17 | `PlayerRecordEvicted` | Archival grace period fully elapsed, unrecoverable |
+| 18 | `ScoutRecordEvicted` | Scout record fully evicted, unrecoverable |
 
 ### `VerificationError` (verification)
 
@@ -468,6 +471,29 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 17 | `MilestoneLimitExceeded` | Validator has already approved 5 milestones for this player |
 | 18 | `DisputeAlreadyResolved` | Dispute was already resolved |
 | 19 | `PendingAdminNotSet` | `accept_admin` called without a prior `propose_admin` |
+| 20 | `ApproveMilestonePaused` | `approve_milestone` function is paused independently |
+| 21 | `SpecializationMismatch` | Validator not tagged for requested milestone category |
+| 22 | `InvalidAttestation` | ed25519 signature verification failed |
+| 23 | `AttestationKeyNotFound` | No attestation public key registered |
+| 24 | `InvalidNonce` | Nonce not strictly greater than last accepted |
+| 25 | `RegistrationCooldown` | Validator registration before cooldown window elapsed |
+| 26 | `DuplicateAttestation` | Same validator already attested to this claim in current round |
+| 27 | `TooManyPendingVotes` | Validator has MAX_PENDING_VOTES_PER_VALIDATOR outstanding votes |
+| 28 | `ThresholdModeRequiresAttestation` | threshold >= 2, must use attest_milestone bypass |
+| 29 | `MigrationNotActive` | Migration window not currently active |
+| 30 | `MilestoneAlreadyExists` | Milestone already exists at (player_id, milestone_index) with different content |
+| 31 | `DisputeAlreadyExists` | Dispute already exists at (player_id, milestone_index) with different content |
+| 32 | `ValidatorRecordEvicted` | Validator record fully evicted, unrecoverable |
+| 33 | `MilestoneRecordEvicted` | Milestone record fully evicted, unrecoverable |
+| 34 | `NotEligibleToReReview` | Caller is not a currently-active validator |
+| 35 | `MilestoneNotFlagged` | Milestone not currently flagged as pending re-review |
+| 36 | `DisputeRequiresJury` | resolve_dispute called on a dispute requiring jury resolution |
+| 37 | `NotJuryDispute` | cast_dispute_vote/tally_dispute called on non-jury dispute |
+| 38 | `VotingWindowClosed` | cast_dispute_vote called after voting window closed |
+| 39 | `ConflictOfInterest` | cast_dispute_vote called by the validator who approved the disputed milestone |
+| 40 | `AlreadyVoted` | cast_dispute_vote called by a validator who already voted on this dispute |
+| 41 | `VotingWindowOpen` | tally_dispute called before voting window closes, vote count is tied |
+| 42 | `QuorumNotReached` | tally_dispute called before quorum of votes has been reached |
 
 ### `ProgressError` (progress)
 
@@ -480,9 +506,14 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 5 | `InvalidProgressTransition` | Level skip or reversal attempted |
 | 6 | `AlreadyAtMaxLevel` | Player is already at `EliteTier` |
 | 7 | `PlayerNotFound` | History index out of range |
-| 8 | `Overflow` | History counter overflowed |
+| 8 | `Overflow` | History counter overflowed the maximum u32 value |
 | 9 | `RegistrationCallFailed` | Cross-contract call to registration contract failed |
 | 10 | `PendingAdminNotSet` | `accept_admin` called without a prior `propose_admin` |
+| 11 | `MigrationNotActive` | Migration window not currently active |
+| 12 | `HistoryAlreadyExists` | HistoryEntry already exists at (player_id, history_index) with different content |
+| 13 | `MerkleRootMismatch` | Independently recomputed Merkle root doesn't match expected root |
+| 14 | `InvalidHistoryIndex` | Supplied history_index is zero, non-contiguous, or would overwrite existing entry |
+| 15 | `PlayerLevelRecordEvicted` | Player-level record fully evicted, unrecoverable |
 
 ### `ScoutAccessError` (scout_access)
 
@@ -500,6 +531,7 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 10 | `Overflow` | Fee accumulation arithmetic overflowed |
 | 11 | `TrialOfferNotFound` | Trial offer index out of range |
 | 12 | `SubscriptionDowngradeNotAllowed` | Downgrade attempted while subscription is active |
+| 13 | **Reserved** | Code 13 is intentionally reserved and must not be assigned; it is held open to prevent future contributors from accidentally colliding with any external consumers that may already treat 13 as an expected (if undocumented) gap. See docs/VERSIONING.md — error-code compatibility. |
 | 14 | `ProgressCallFailed` | Cross-contract `advance_level` failed in `confirm_trial_offer` |
 | 15 | `InvalidInput` | Zero/negative fee field in `FeeConfig`, or bad token address in `initialize` |
 | 16 | `NoFeesToWithdraw` | No accumulated fees to withdraw |
@@ -510,8 +542,21 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 21 | `PendingAdminNotSet` | `accept_admin` called without a prior `propose_admin` |
 | 22 | `TrialOfferAlreadyConfirmed` | `confirm_trial_offer` called twice for same offer |
 | 23 | `TrialOfferExpired` | Legacy compatibility code; expiry confirmation now commits the refund and returns success |
-
-> **Note:** Code 13 is intentionally reserved in `ScoutAccessError` and must not be assigned.
+| 24 | `NoPendingFeeConfig` | No pending fee config proposal exists for `activate_fee_config` |
+| 25 | `FeeConfigProposalNotReady` | Pending fee config proposal activation delay has not yet elapsed |
+| 26 | `PendingFeeConfigAlreadyExists` | A fee config proposal already exists; must activate or replace it |
+| 27 | `ScoutNotVerified` | Scout is not verified; cannot subscribe to Pro tier |
+| 28 | `AutoRenewNotEnabled` | `renew_if_due` called but auto-renewal is not enabled |
+| 29 | `MigrationNotActive` | Migration window not currently active |
+| 30 | `SubscriptionAlreadyExists` | Subscription already exists for this scout address with different content |
+| 31 | `ContactAlreadyExists` | ContactRecord already exists for (player_id, scout) with different content |
+| 32 | `TrialOfferAlreadyExists` | TrialOffer already exists at (player_id, trial_index) with different content |
+| 33 | `AutoRenewAlreadyExists` | AutoRenew flag already exists for this scout with a different value |
+| 34 | `FeeConfigHistoryAlreadyExists` | Fee-config history replay conflicts with history already stored |
+| 35 | `SubscriptionRecordEvicted` | Subscription record fully evicted, unrecoverable |
+| 36 | `PayToContactPaused` | `pay_to_contact` function is paused independently of whole-contract pause |
+| 37 | `TrialEscrowNotOutstanding` | `admin_refund_trial_escrow` targeted pair with no outstanding `TrialEscrow` entry |
+| 38 | `GrantNotFound` | `admin_revoke_evidence_access` targeted (player_id, scout) pair with no `EvidenceAccessGrant` record |
 
 ---
 
@@ -582,8 +627,10 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
 | `milestone_approved` | event_name, validator (Address), milestone_index (u32) | player_id (u64), description (String), evidence_hash (String) | ✅ |
 | `validator_registered` | event_name, wallet (Address) | wallet (Address), credentials (String) | ✅ |
 | `validator_revoked` | event_name | wallet (Address), reason (String) | ✅ |
+| `validator_votes_invalidated` | event_name | wallet (Address) | ✅ |
 | `validator_restored` | event_name | wallet (Address) | ✅ |
 | `validator_transferred` | event_name | old_wallet (Address), new_wallet (Address) | ✅ |
+| `milestone_flagged` | event_name, player_id (u64), milestone_index (u32) | () | ✅ |
 | `milestone_disputed` | event_name, player_id (u64), milestone_index (u32) | reason (String) | ✅ |
 | `dispute_resolved` | event_name, player_id (u64), milestone_index (u32) | upheld (bool) | ✅ |
 | `progress_contract_updated` | event_name | new_address (Address) | ✅ |

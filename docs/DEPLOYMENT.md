@@ -7,7 +7,8 @@
 >
 > **Full field reference:** See [`docs/CONFIG_REFERENCE.md`](CONFIG_REFERENCE.md) for a complete description of every field in `config/testnet.json` and `config/mainnet.json`, including where each value is used and mainnet deployment requirements.
 
-- Rust + `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
+- Rust + `wasm32v1-none` target: `rustup target add wasm32v1-none`
+  (Note: `rust-toolchain.toml` in this repo auto-selects the correct target when you run `cargo` from the project directory, so this step is only needed for manual `stellar contract install` invocations outside of `cargo`.)
 - Stellar CLI: https://developers.stellar.org/docs/tools/developer-tools/cli/install-stellar-cli
 - A funded Stellar keypair for deployment
 

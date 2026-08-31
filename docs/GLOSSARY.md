@@ -43,6 +43,17 @@ scout opts in via `set_auto_renew(scout, enabled)` (emitting the
 or the scout — can call `renew_if_due(scout)` when the subscription is due,
 emitting `subscription_auto_renewed` on success.
 
+Each renewal anchors the new `expires_at` to
+`max(old_expires_at, now) + sub_duration_secs` rather than
+`now + sub_duration_secs`, so consecutive on-time-ish renewals produce
+contiguous non-overlapping periods. The same anchored `expires_at` defines
+the `pro_contact_limit` period boundary, keeping that reset aligned with the
+coverage period. Renewals are due within the
+`renewal_window_secs = sub_duration_secs / 10` grace window (3 days for the
+30-day default); the window is floored at 1 second, so the minimum sensible
+`sub_duration_secs` is 10 seconds (any shorter duration makes the computed
+window 0 and relies on the clamp).
+
 If auto-renewal is not enabled for a scout, `renew_if_due` returns the
 `AutoRenewNotEnabled` error (`ScoutAccessError` code 28).
 
@@ -165,6 +176,26 @@ window the confirmation path refunds the scout's escrow and emits
 
 - Relevant functions: `initialize`, `update_fee_config`, `get_fee_config` — see
   [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md#scout_access).
+
+---
+
+## Migration Window
+
+An admin-toggled instance flag on each contract that gates all `admin_seed_*` state-seeding functions. When the migration window is open (`migration_window_is_open` returns `true`), operators may call the seeding entrypoints to replay exported state onto a freshly deployed contract without requiring the original wallet signatures. When the window is closed, all `admin_seed_*` calls are rejected with `MigrationNotActive`.
+
+The window is opened with `open_migration_window` and closed with `close_migration_window` (both admin-only). It should be kept open only for the duration of a controlled replay, then closed before the new contract begins serving real traffic.
+
+Affected seeding functions (present on all four contracts):
+
+- `registration`: `admin_seed_player`, `admin_seed_scout`
+- `verification`: `admin_seed_validator`, `admin_seed_milestone`
+- `progress`: `admin_seed_history`
+- `scout_access`: `admin_seed_subscription`, `admin_seed_contact`
+
+Tooling: `scripts/replay-state.sh` opens the window, seeds all replayable data categories, then closes it. `scripts/migrate-contract.sh` orchestrates the full migration including this step.
+
+- See [docs/MIGRATION_GAPS.md](MIGRATION_GAPS.md) for the canonical list of which data categories are fully, partially, or not replayable.
+- See [docs/DEPLOYMENT.md — Address migration](DEPLOYMENT.md#address-migration-new-contract-id) for the step-by-step migration procedure.
 
 ---
 

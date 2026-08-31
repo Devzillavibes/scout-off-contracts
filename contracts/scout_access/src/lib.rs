@@ -818,7 +818,9 @@ impl ScoutAccessContract {
 
         Self::collect_fee(&env, &scout, fee)?;
 
-        let expires_at = now
+        // Anchor to max(prior expiry, now) so late keeper runs don't drift.
+        let period_start = existing.expires_at.max(now);
+        let expires_at = period_start
             .checked_add(config.sub_duration_secs)
             .ok_or(ScoutAccessError::Overflow)?;
 
@@ -826,7 +828,7 @@ impl ScoutAccessContract {
             scout: scout.clone(),
             tier: existing.tier.clone(),
             expires_at,
-            subscribed_at: now,
+            subscribed_at: period_start,
         };
 
         env.storage()
@@ -841,7 +843,7 @@ impl ScoutAccessContract {
         // ISSUE #1139: Maintain tier index on renewal
         Self::add_to_tier_index(&env, &scout, &existing.tier);
 
-        events::subscription_auto_renewed(&env, &scout, &existing.tier, now, expires_at);
+        events::subscription_auto_renewed(&env, &scout, &existing.tier, period_start, expires_at);
         // Also emit the legacy scout_subscribed event for backward compatibility.
         events::scout_subscribed(&env, &scout, &existing.tier, fee);
         Ok(())
@@ -6141,8 +6143,10 @@ mod tests {
 
         let after = client.get_subscription(&scout);
         // A new subscription was written; expires_at must advance.
-        assert!(after.expires_at > before.expires_at);
-        assert_eq!(after.subscribed_at, renewal_ts);
+        // Renewal inside the pre-expiry window is anchored to the prior expiry,
+        // not to the renewal timestamp, so the next period is contiguous.
+        assert_eq!(after.expires_at, before.expires_at + sub_duration);
+        assert_eq!(after.subscribed_at, before.expires_at);
     }
 
     #[test]
@@ -6172,6 +6176,39 @@ mod tests {
         // expires_at should be roughly now + sub_duration.
         let expected_expiry = before.expires_at + 100 + sub_duration;
         assert_eq!(after.expires_at, expected_expiry);
+    }
+
+    #[test]
+    fn test_renew_if_due_12_late_renewals_keep_full_coverage() {
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, _admin, xlm, _contract_id, client) = setup();
+        let scout = Address::generate(&env);
+        mint_token(&env, &xlm, &_admin, &scout, 100_000_000);
+
+        let sub_duration: u64 = 30 * 24 * 60 * 60;
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        client.subscribe(&scout, &SubscriptionTier::Basic);
+        client.set_auto_renew(&scout, &true);
+
+        let mut sub = client.get_subscription(&scout);
+        let initial_expiry = sub.expires_at;
+
+        // Each keeper run is one hour after the current expiry — late, but
+        // still within the renewal window the keeper is expected to use.
+        for _ in 0..12 {
+            env.ledger()
+                .with_mut(|l| l.timestamp = sub.expires_at + 3600);
+            client.renew_if_due(&scout);
+            sub = client.get_subscription(&scout);
+        }
+
+        // The 12 renewals must deliver 12 full subscription durations of
+        // additional coverage, with only the one-hour lateness added.
+        assert_eq!(
+            sub.expires_at,
+            initial_expiry + sub_duration * 12 + 3600 * 12,
+        );
     }
 
     #[test]

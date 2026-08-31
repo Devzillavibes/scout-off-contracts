@@ -39,9 +39,16 @@ pub struct Subscription {
     pub scout: Address,
     /// Active subscription tier for authorization and fee checks.
     pub tier: SubscriptionTier,
-    /// Ledger timestamp when the subscription expires, in Unix seconds.
+    /// Ledger timestamp when the current paid period expires, in Unix seconds.
+    ///
+    /// Auto-renewal anchors the next expiry to `max(prior expires_at, renewal
+    /// ledger timestamp) + FeeConfig::sub_duration_secs`, so late-but-in-window
+    /// renewals extend from the prior expiry and consecutive renewals remain
+    /// contiguous.
     pub expires_at: u64,
-    /// Ledger timestamp when the subscription started, in Unix seconds.
+    /// Ledger timestamp when the current paid period started, in Unix seconds.
+    /// Auto-renewals set this to the same anchor as `expires_at` minus
+    /// `sub_duration_secs`, keeping `ProContactPeriod` aligned.
     pub subscribed_at: u64,
 }
 
@@ -75,11 +82,15 @@ pub struct TrialOffer {
 /// subscription period.  `period_start` is the `subscribed_at` timestamp of
 /// the current subscription; when the scout renews, a new record is stored
 /// (keyed by the new `subscribed_at`), effectively resetting the counter.
+/// Auto-renewal anchors `period_start` to `max(prior expires_at, now)`, so
+/// the pro-contact limit period advances by whole subscription durations and
+/// does not drift.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProContactPeriod {
     /// `subscribed_at` of the subscription this counter belongs to.
-    /// Used to detect period rollovers on subscription renewal.
+    /// Used to detect period rollovers on subscription renewal. For
+    /// auto-renewals this equals `max(prior expires_at, renewal timestamp)`.
     pub period_start: u64,
     /// Number of contacts made in this period.
     pub count: u32,
@@ -123,6 +134,11 @@ pub struct FeeConfig {
     /// Elite subscription fee in stroops
     pub elite_sub_stroops: i128,
     /// Subscription duration in seconds (default: 30 days)
+    ///
+    /// Auto-renewal uses a grace window of `max(1, sub_duration_secs / 10)`.
+    /// For very short durations the window floors at 1 second; prefer
+    /// `sub_duration_secs >= 10` so the configured window is a true tenth of
+    /// the subscription period.
     pub sub_duration_secs: u64,
     /// Trial offer escrow hold amount in stroops.
     /// Must be > 0 when trial offers are enabled; 0 disables trial offers.

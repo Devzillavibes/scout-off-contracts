@@ -729,7 +729,7 @@ impl VerificationContract {
         // still-open (sub-threshold) pending attestation claim.
         let invalidated = Self::invalidate_pending_votes_for_validator(&env, &wallet);
         if invalidated > 0 {
-            events::validator_pending_votes_invalidated(&env, &admin, &wallet, invalidated);
+            events::validator_votes_invalidated(&env, &admin, &wallet, invalidated);
         }
 
         let reason_str = reason.unwrap_or(String::from_str(&env, ""));
@@ -806,7 +806,7 @@ impl VerificationContract {
     ///
     /// Starting from `start_index` (0-based position in `ValidatorMilestones`),
     /// flags up to `CASCADE_LIMIT` milestones as `MilestonePendingReReview`,
-    /// emitting `milestone_flagged_for_rereview` for each.
+    /// emitting `milestone_flagged` for each.
     ///
     /// If the sweep is completed (fewer remaining milestones than the limit),
     /// removes the cursor and emits `revocation_cascade_complete`.
@@ -899,7 +899,7 @@ impl VerificationContract {
                 page.push_back(m_ref.clone());
                 pending_count =
                     safe_add_u32(pending_count, 1).map_err(|_| VerificationError::Overflow)?;
-                events::milestone_flagged_for_rereview(
+                events::milestone_flagged(
                     env,
                     wallet,
                     m_ref.player_id,
@@ -1003,7 +1003,7 @@ impl VerificationContract {
 
             let invalidated = Self::invalidate_pending_votes_for_validator(&env, &wallet);
             if invalidated > 0 {
-                events::validator_pending_votes_invalidated(&env, &admin, &wallet, invalidated);
+                events::validator_votes_invalidated(&env, &admin, &wallet, invalidated);
             }
 
             // Persist a RevocationRecord for each wallet.
