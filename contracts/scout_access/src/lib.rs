@@ -617,7 +617,7 @@ impl ScoutAccessContract {
             // If registration contract is not wired, allow Pro-tier subscription (graceful degradation)
         }
 
-        let config = Self::fee_config(&env);
+        let config = Self::fee_config(&env)?;
         let fee = match &tier {
             SubscriptionTier::Basic => config.basic_sub_stroops,
             SubscriptionTier::Pro => config.pro_sub_stroops,
