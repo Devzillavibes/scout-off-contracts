@@ -11,25 +11,37 @@
 
 ## Background
 
-### The confirmed code gap
+### The confirmed code gap (status: fixed)
 
-The current `log_trial_offer` implementation in `contracts/scout_access/src/lib.rs`
-logs a trial offer on-chain and advances a player to `EliteTier`, but the
-`expire_trial_offers` function — which is supposed to sweep unconfirmed trial
-offers and refund locked escrow — **is currently a no-op stub**. Nothing
-releases escrow back to scouts for offers that are never confirmed.
+> **Update:** this section originally described a state where `log_trial_offer`
+> logged trial offers without collecting any escrow, so `trial_offer_escrow_stroops`
+> was purely aspirational and no capital was actually at risk. That has since
+> shipped (#795): `log_trial_offer` now collects the escrow via a real token
+> transfer, `contracts/scout_access/src/types.rs` defines `TrialEscrow` and
+> `trial_offer_escrow_stroops` is a live `FeeConfig` field, and
+> `expire_trial_offers` is an implemented, bounded sweep (see
+> `docs/GAS_GRIEFING_AUDIT.md`) rather than a no-op stub. The original risk
+> analysis and recommendations below remain valid — they just now describe a
+> present, not a hypothetical, condition.
 
-If a `trial_offer_escrow_stroops` fee is ever introduced (the natural next step
-once confirm/expire flows are built), every scout-logged trial offer that is
-never confirmed or explicitly expired will permanently lock that escrow in the
-contract with no recovery path under the current code.
+The live `log_trial_offer` implementation in `contracts/scout_access/src/lib.rs`
+logs a trial offer on-chain, collects `trial_offer_escrow_stroops` from the
+scout into a `TrialEscrow` record, and advances a player to `EliteTier`.
+Unconfirmed offers are released by three shipped paths: `confirm_trial_offer`'s
+late-expiry branch, the admin-run `expire_trial_offers` sweep, and the
+operation-targeted `admin_refund_trial_escrow` escape hatch for a specific
+identified stuck entry.
+
+This document is deliberately written as an impact analysis against the shipped
+behavior: the economic model remains useful, but the risk assumptions are now
+validated against actual code paths rather than imagined future ones.
 
 This document cross-references:
 
-- **expire_trial_offers implementation issue** — the code-level fix (sweep
-  function that refunds stale escrow).
-- **TrialEscrow enumeration-index issue** — enumerating locked escrow entries
-  so admin tooling can identify and manually recover them.
+- **expire_trial_offers implementation** — the bounded sweep that refunds stale
+  trial escrow after the configured expiry window.
+- **TrialEscrow enumeration-index** — enumerating locked escrow entries so admin
+  tooling can identify and recover stuck entries in practice.
 
 ---
 
@@ -45,11 +57,13 @@ and the `initialize` call in the README:
 | `pro_sub_stroops` | 3,000,000 | 0.30 XLM |
 | `elite_sub_stroops` | 7,000,000 | 0.70 XLM |
 
-A trial offer escrow fee is **not yet in `FeeConfig`**, but the intended design
-calls for a `trial_offer_escrow_stroops` field that locks XLM from the scout
-when `log_trial_offer` is called, to be released on `confirm_trial_offer` or
-returned on `expire_trial_offer`. For this analysis we model two plausible
-escrow values that bracket a realistic range:
+The currently shipped fee model includes a live `trial_offer_escrow_stroops`
+field and a `trial_offer_expiry_secs` window in `FeeConfig`. In the 0.05 XLM
+example configuration, `log_trial_offer` locks 500,000 stroops per offer, and
+expired entries can be swept by `expire_trial_offers` or manually resolved by
+`admin_refund_trial_escrow`.
+
+For this analysis we model the same economic range against the shipped behavior:
 
 | Scenario | Trial escrow per offer | Rationale |
 |----------|----------------------|-----------|
@@ -145,41 +159,41 @@ capital over 24 months at a 30% never-confirmed rate. A more meaningful
 
 ## Recommendation
 
-### 1. Prioritize the `expire_trial_offers` fix — YES
+### 1. Monitor the live escrow footprint against real usage
 
-This analysis justifies **prioritizing the `expire_trial_offers` fix ahead of
-new features** once `trial_offer_escrow_stroops` is introduced. The locked
-capital is not recoverable without either a contract upgrade or an admin
-escape hatch, and it grows without bound. The 24-month expected-scenario
-number (800–8,000 XLM depending on escrow amount) is large enough to affect
-scout trust and platform credibility.
+This analysis supports **continuing to monitor the live escrow footprint** as the
+platform scales, rather than treating it as a deferred code fix. The shipped
+`trial_offer_escrow_stroops` and `trial_offer_expiry_secs` settings are real
+capital controls, and the 24-month expected-scenario numbers (800–8,000 XLM
+depending on escrow amount) are large enough to matter for scout trust and
+operational risk if never-confirmed rates remain elevated.
 
-The fix is also low-risk: `expire_trial_offers` is already stubbed; it needs
-a well-defined expiry window, an index over unconfirmed offers, and a token
-transfer back to the scout. This is a bounded, testable change.
+The important operational point is that the system now has a bounded sweep and
+an explicit recovery path, so the right question is not "is the fix missing?"
+but "what is the observed volume and failure rate in production?"
 
-### 2. Implement an interim admin mitigation — YES, in parallel
+### 2. Keep `admin_refund_trial_escrow` as an operational safeguard
 
-While the proper sweep function is being built, add an admin-callable
-`admin_refund_trial_escrow(player_id: u64, offer_index: u32, to: Address)`
-function — analogous to the existing `refund_subscription` — that allows
-manual rescue of identified stuck escrow entries.
+`admin_refund_trial_escrow(player_id: u64, offer_index: u32, to: Address)` is
+shipped and remains a useful admin-only safety valve analogous to
+`refund_subscription`. It lets operations directly resolve one specific,
+identified stuck `TrialEscrow` entry without waiting for a generic
+`expire_trial_offers` sweep to reach it. It rejects any target that is not
+currently outstanding (already confirmed, already expired/refunded, or never
+logged) and removes the entry from `OutstandingTrialEscrows` on success, so
+neither a later sweep nor a late `confirm_trial_offer` can act on it again.
 
-This provides a zero-downtime safety valve: operations can manually refund
-scouts who complain about locked capital while the automated fix is
-developed and audited.
+This is best framed as a targeted operational recovery tool, not a substitute
+for monitoring the backlog of expired offers and the configured expiry window.
 
-The TrialEscrow enumeration-index fix (tracked separately) is a prerequisite
-for making this admin tooling practical, since without an index, identifying
-stuck offers requires iterating all `(player_id, offer_index)` pairs off-chain.
+### 3. Treat the escrow config as active, validated, and auditable
 
-### 3. Do not introduce `trial_offer_escrow_stroops` without the fix in place
-
-The current implementation logs trial offers without collecting any escrow,
-so no capital is currently at risk. **Do not add the escrow collection step**
-to `log_trial_offer` until `expire_trial_offers` is functional and the
-enumeration index exists. Introducing escrow collection before the release
-path exists converts a future risk into an immediate certainty.
+The premise behind the original concern is no longer hypothetical:
+`trial_offer_escrow_stroops` is a live `FeeConfig` field, `trial_offer_expiry_secs`
+is a live expiry configuration, and `log_trial_offer` collects the escrow via an
+actual token transfer. The release paths this analysis depends on —
+`expire_trial_offers` and `admin_refund_trial_escrow` — are both implemented and
+can be validated against live usage data.
 
 ---
 
@@ -197,7 +211,8 @@ path exists converts a future risk into an immediate certainty.
   it manually).
 
 **Once real platform data is available, replace the assumption table above
-with measured values and re-run the projections.**
+with measured values and re-run the projections against the live fee settings and
+truly observed expiry/sweep behavior.**
 
 ---
 

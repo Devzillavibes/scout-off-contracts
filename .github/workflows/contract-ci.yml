@@ -99,6 +99,10 @@ jobs:
           shellcheck scripts/check-event-topic-consistency.sh
           shellcheck scripts/check-guard-ordering.sh
           shellcheck scripts/check-cross-doc-consistency.sh
+          shellcheck scripts/check-trial-offer-flow-consistency.sh
+          shellcheck scripts/check-error-code-continuity.sh
+          shellcheck scripts/check-cargo-doc.sh
+          shellcheck scripts/check-migration-numbering.sh
       - name: Docs completeness check
         run: bash scripts/check-docs.sh
       - name: Event-topic consistency check
@@ -107,6 +111,14 @@ jobs:
         run: bash scripts/check-guard-ordering.sh
       - name: Cross-doc consistency check
         run: bash scripts/check-cross-doc-consistency.sh
+      - name: Trial-offer flow doc consistency check
+        run: bash scripts/check-trial-offer-flow-consistency.sh
+      - name: Error-code continuity check
+        run: bash scripts/check-error-code-continuity.sh
+      - name: Cargo doc missing-documentation check
+        run: bash scripts/check-cargo-doc.sh
+      - name: Migration numbering check
+        run: bash scripts/check-migration-numbering.sh
       - name: Validate bindings package.json templates
         run: bash scripts/check-bindings.sh
 
@@ -517,15 +529,7 @@ jobs:
             stellar contract optimize --wasm "$wasm_src" --wasm-out "$wasm_opt"
             size=$(wc -c < "$wasm_opt" | tr -d ' ')
             echo "    ${contract}: ${size} bytes (optimized)"
-            python3 -c "
-import json
-path = 'abi/wasm-sizes.json'
-with open(path) as f:
-    data = json.load(f)
-data['${contract}'] = ${size}
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2, sort_keys=True)
-"
+            python3 scripts/record_wasm_sizes.py "${contract}"
           done
           echo ""
           echo "==> abi/wasm-sizes.json:"
@@ -580,6 +584,45 @@ with open(path, 'w') as f:
           path: abi/*.json
           if-no-files-found: error
 
+  abi-diff:
+    name: ABI Diff Gate
+    runs-on: ubuntu-latest
+    needs: abi-export
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch ABI files
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.base_ref }}"
+          if [[ -z "$BASE_REF" ]]; then
+            BASE_REF="main"
+          fi
+          echo "Base ref: $BASE_REF"
+          git fetch origin "$BASE_REF" --depth=1 || true
+          mkdir -p abi/base
+          for contract in registration verification progress scout_access; do
+            if git show "origin/$BASE_REF:abi/${contract}-abi.json" > "abi/base/${contract}-abi.json" 2>/dev/null; then
+              echo "  Fetched base ABI for $contract"
+            else
+              echo "  No base ABI found for $contract (treating as new)"
+              echo "{}" > "abi/base/${contract}-abi.json"
+            fi
+          done
+
+      - name: Run ABI diff gate
+        run: bash scripts/check-abi-diff.sh origin/${{ github.base_ref || 'main' }}
+
+      - name: Upload ABI diff report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abi-diff-report-${{ github.sha }}
+          path: abi/*.json
+          if-no-files-found: ignore
   budget-calibration:
     name: Budget Calibration
     runs-on: ubuntu-latest

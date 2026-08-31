@@ -51,6 +51,11 @@ pub enum ScoutAccessError {
     /// The trial offer record was not found.
     TrialOfferNotFound = 11,
     /// Pro tier scout has exceeded monthly contact limit.
+    ///
+    /// DEPRECATED: this error code is no longer returned by any contract
+    /// function. It is retained here only to reserve slot 18 and prevent
+    /// accidental reassignment, matching the code-13 reservation pattern.
+    /// Callers should handle `ProContactLimitReached` (20) instead.
     ContactQuotaExceeded = 18,
     /// Scout sent a trial offer to the same player within the cooldown window.
     TrialOfferRateLimited = 19,
@@ -58,7 +63,9 @@ pub enum ScoutAccessError {
     ProContactLimitReached = 20,
     /// The trial offer has already been confirmed.
     TrialOfferAlreadyConfirmed = 22,
-    /// The trial offer has expired without confirmation.
+    /// Legacy compatibility code for an expired offer. The current expiry
+    /// path commits the refund and returns `Ok(())` because returning this
+    /// error would roll back the refund under Soroban transaction semantics.
     TrialOfferExpired = 23,
 
     // ── Cross-contract & arithmetic ──
@@ -82,6 +89,51 @@ pub enum ScoutAccessError {
     // ── Sybil resistance ──
     /// Scout is not verified; cannot subscribe to Pro tier.
     ScoutNotVerified = 27,
+
+    // ── Auto-renewal ──
+    /// `renew_if_due` was called but auto-renewal is not enabled for this scout.
+    AutoRenewNotEnabled = 28,
+
+    // ── Migration ──
+    /// Migration window is not currently active on this contract.
+    /// Call `open_migration_window` (admin-only) before seeding state.
+    MigrationNotActive = 29,
+    /// A `Subscription` already exists for this scout address with different
+    /// content. Identical replays are no-ops; conflicting replays are rejected.
+    SubscriptionAlreadyExists = 30,
+    /// A `ContactRecord` already exists for `(player_id, scout)` with different
+    /// content. Identical replays are no-ops.
+    ContactAlreadyExists = 31,
+    /// A `TrialOffer` already exists at `(player_id, trial_index)` with
+    /// different content. Identical replays are no-ops.
+    TrialOfferAlreadyExists = 32,
+    /// An `AutoRenew` flag already exists for this scout with a different value.
+    /// Identical replays are no-ops.
+    AutoRenewAlreadyExists = 33,
+    /// A fee-config history replay conflicts with history already stored.
+    FeeConfigHistoryAlreadyExists = 34,
+    /// `restore_subscription_record` targeted a subscription entry whose
+    /// archival grace period has fully elapsed (evicted, not merely archived)
+    /// and is unrecoverable. (Codes 13 and 18 are reserved by tests.)
+    SubscriptionRecordEvicted = 35,
+
+    // ── Function-scoped pausing ──
+    /// The `pay_to_contact` function is paused independently of the
+    /// whole-contract pause (issue #1056). Mirrors `verification`'s
+    /// `ApproveMilestonePaused`.
+    PayToContactPaused = 36,
+
+    // ── Trial escrow rescue ──
+    /// `admin_refund_trial_escrow` targeted a `(player_id, offer_index)` pair
+    /// with no outstanding `TrialEscrow` entry: it was never created, or was
+    /// already released by `confirm_trial_offer` or `expire_trial_offers`
+    /// (or by a prior `admin_refund_trial_escrow` call).
+    TrialEscrowNotOutstanding = 37,
+
+    // ── Evidence access grants ──
+    /// `admin_revoke_evidence_access` targeted a (player_id, scout) pair for
+    /// which no `EvidenceAccessGrant` record exists.
+    GrantNotFound = 38,
 }
 
 impl AdminError for ScoutAccessError {
@@ -140,5 +192,20 @@ mod tests {
 
             next_implicit_code = Some(assigned_code + 1);
         }
+    }
+
+    #[test]
+    fn contact_quota_exceeded_is_deprecated_slot_18_reserved() {
+        assert_eq!(ScoutAccessError::ContactQuotaExceeded as u32, 18);
+    }
+
+    #[test]
+    fn pro_contact_limit_reached_is_code_20() {
+        assert_eq!(ScoutAccessError::ProContactLimitReached as u32, 20);
+    }
+
+    #[test]
+    fn grant_not_found_is_code_38() {
+        assert_eq!(ScoutAccessError::GrantNotFound as u32, 38);
     }
 }
