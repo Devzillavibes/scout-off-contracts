@@ -30,6 +30,78 @@ Run ./scripts/emergency-pause.sh
 > If the script exits mid-way (e.g. network error), run it again — the already-
 > paused contracts will return `ContractPaused` but will not change state.
 > Continue from the failed contract manually if needed.
+```
+
+## Function-Scoped Circuit Breakers
+
+### When to Use `pause_approve_milestone` Instead of `pause_contract`
+
+**Use `pause_approve_milestone` if:**
+- Only milestone approval has been compromised or has a bug
+- Validators are being investigated; don't block validator registration/revocation
+- Cross-contract issue with progress contract; other verification logic is fine
+
+**Use `pause_contract` (whole contract) if:**
+- Multiple functions are affected
+- Vulnerability is in core contract logic, not a specific function
+- Need immediate shutdown of all state changes
+
+### Example: Validator Collusion Incident
+
+```bash
+# 1. Pause only approve_milestone while investigation continues
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- pause_approve_milestone
+
+# 2. Continue validator operations (registration, revocation)
+# 3. Query health to confirm state
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- health
+
+# 4. Once investigation complete, unpause
+stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
+  -- unpause_approve_milestone
+```
+
+### When to Use `pause_pay_to_contact` Instead of `pause_contract`
+
+**Use `pause_pay_to_contact` if:**
+- Fee-charging `pay_to_contact` has been compromised or has a bug
+- Need to halt contact fees while keeping scout operations (subscribe, renew, read state) running
+- Cross-contract issue affecting payments but not scout admin functions
+
+**Use `pause_contract` (whole contract) if:**
+- Multiple functions are affected
+- Core contract logic vulnerability
+- Need immediate shutdown of all state changes
+
+### Example: Payment Issue Incident
+
+```bash
+# 1. Pause only pay_to_contact while investigation continues
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- pause_pay_to_contact
+
+# 2. Continue scout operations (subscribe, renew, read state)
+# 3. Query health to confirm state
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- health
+
+# 4. Once investigation complete, unpause
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- unpause_pay_to_contact
+```
+
+### Monitoring
+
+Subscribe to events to detect and verify pause state changes:
+
+- `approve_milestone_paused` — Function-scoped pause for verify activated
+- `approve_milestone_unpaused` — Function-scoped pause for verify lifted
+- `pay_to_contact_paused` — Function-scoped pause for scout_access activated
+- `pay_to_contact_unpaused` — Function-scoped pause for scout_access lifted
+- `contract_paused` — Whole-contract pause (overrides function-scoped state)
+```
 
 ### Manual pause (contract by contract)
 
@@ -67,6 +139,121 @@ Expected output for each contract:
 
 A `"paused":false` response means that contract was not successfully paused —
 re-run the pause command for that contract before proceeding.
+
+---
+
+## Rehearse Routine Admin Rotation
+
+Use `scripts/rehearse-admin-rotation.sh` to rehearse the two-step
+`propose_admin` → `accept_admin` rotation procedure on a **disposable**
+local or testnet deployment before performing it against a real shared
+testnet or mainnet contract.
+
+This is the **routine, happy-path** counterpart to the tabletop exercise in
+[Emergency: Admin Key Loss / Compromise](#emergency-admin-key-loss--compromise)
+above. That exercise rehearses the failure scenario; this one rehearses the
+normal, successful procedure so operators have practised it at least once
+before they need to do it for real (e.g. onboarding a new platform operator,
+rotating keys after a team member leaves, or regular security hygiene).
+
+### When to run this
+
+- Before performing a routine admin rotation on a shared testnet for the
+  first time.
+- Before performing a rotation on mainnet.
+- Any time the rotation procedure in `ai.md` or `docs/DEPLOYMENT.md` is
+  updated — re-run to confirm the new steps still work end-to-end.
+- As part of onboarding a new operator who will be responsible for admin
+  rotations.
+
+### Prerequisites
+
+- `stellar-cli` installed at the pinned version (see `docs/CONTRIBUTING.md`).
+- A running local Soroban quickstart sandbox **or** testnet access with
+  funded accounts.
+- For local: start the sandbox first (see `docs/DEPLOYMENT.md` or the
+  `bindings-smoke-test` CI job for the exact `docker run` command).
+
+### Run the rehearsal
+
+```bash
+# Against the local quickstart sandbox (default):
+bash scripts/rehearse-admin-rotation.sh local
+
+# Against Stellar testnet (will request funding via friendbot):
+bash scripts/rehearse-admin-rotation.sh testnet
+```
+
+The script:
+1. Generates two fresh ephemeral Stellar identities (`OLD_ADMIN` and `NEW_ADMIN`).
+2. Funds both via friendbot.
+3. Builds and deploys a fresh, isolated set of all four contracts.
+4. Initialises them with `OLD_ADMIN`.
+5. For each contract, performs `propose_admin(NEW_ADMIN)` then `accept_admin()`.
+6. Verifies `NEW_ADMIN` can call `pause_contract` / `unpause_contract`
+   (admin-only operations) after the rotation.
+7. Verifies `OLD_ADMIN` is correctly rejected from admin-only operations.
+8. Cleans up the ephemeral identities.
+
+A `PASS` result means the full rotation procedure worked end-to-end on a
+real Soroban contract deployment and you are ready to perform the same
+steps on your intended target.
+
+### After a successful rehearsal
+
+When you are ready to rotate on a real deployment:
+
+```bash
+# Load the real contract IDs
+source .env.contracts
+
+# --- On the CURRENT admin machine: ---
+stellar contract invoke --id "$REGISTRATION_CONTRACT_ID" \
+  --source "$CURRENT_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- propose_admin --new_admin "$NEW_ADMIN_ADDRESS"
+
+stellar contract invoke --id "$VERIFICATION_CONTRACT_ID" \
+  --source "$CURRENT_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- propose_admin --new_admin "$NEW_ADMIN_ADDRESS"
+
+stellar contract invoke --id "$PROGRESS_CONTRACT_ID" \
+  --source "$CURRENT_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- propose_admin --new_admin "$NEW_ADMIN_ADDRESS"
+
+stellar contract invoke --id "$SCOUT_ACCESS_CONTRACT_ID" \
+  --source "$CURRENT_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- propose_admin --new_admin "$NEW_ADMIN_ADDRESS"
+
+# --- On the NEW admin machine (the incoming operator): ---
+stellar contract invoke --id "$REGISTRATION_CONTRACT_ID" \
+  --source "$NEW_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- accept_admin
+
+stellar contract invoke --id "$VERIFICATION_CONTRACT_ID" \
+  --source "$NEW_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- accept_admin
+
+stellar contract invoke --id "$PROGRESS_CONTRACT_ID" \
+  --source "$NEW_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- accept_admin
+
+stellar contract invoke --id "$SCOUT_ACCESS_CONTRACT_ID" \
+  --source "$NEW_ADMIN_SECRET" --network "$STELLAR_NETWORK" \
+  -- accept_admin
+```
+
+> **Note**: `propose_admin` stores the proposed address on-chain. The current
+> admin retains all privileges until `accept_admin` is called from the new
+> address — the rotation is not complete until both steps succeed on every
+> contract. Confirm with `health()` and a test admin call after each
+> `accept_admin` to ensure the contract is live and the new key works.
+
+### Scope
+
+This procedure covers the **routine, non-emergency rotation**. For the
+scenario where the current admin key is lost or compromised and cannot sign
+`propose_admin`, see
+[Emergency: Admin Key Loss / Compromise](#emergency-admin-key-loss--compromise).
 
 ---
 
@@ -114,6 +301,9 @@ social-recovery or governance primitive to fall back to, and the two-step
 admin to sign the first step. This is the scenario one level worse than
 "we need to pause a buggy contract" (see the pause procedure above): here,
 the team cannot even issue that first `pause_contract` call.
+
+For response-time expectations and incident-severity guidance, see
+[`SECURITY.md#emergency-response-immediate-mitigation`](../SECURITY.md#emergency-response-immediate-mitigation).
 
 This section assumes the multisig/timelock admin work tracked in
 [issue #609](https://github.com/scout-off/scout-off-contracts/issues/609)
