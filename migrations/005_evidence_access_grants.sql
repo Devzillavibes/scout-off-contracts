@@ -1,4 +1,4 @@
--- migrations/004_evidence_access_grants.sql
+-- migrations/005_evidence_access_grants.sql
 -- Off-chain mirror of scout_access.EvidenceAccessGrant — see
 -- docs/EVIDENCE_PRIVACY.md and docs/INDEXER.md.
 --

@@ -37,7 +37,7 @@ This breaking change is **intentional and expected**, as documented in:
 
 1. **New deployments:** No action required; the contract is deployed fresh.
 2. **Upgrades from v0.3.0 (verification) on testnet or mainnet:**
-   - Run `migrations/005_dispute_jury.sql` against the indexer PostgreSQL
+   - Run `migrations/006_dispute_jury.sql` against the indexer PostgreSQL
      database **before** activating the new WASM.
    - Existing `MilestoneDispute` storage entries written by v0.3.0 will be
      unreadable after upgrade. Operators must resolve or acknowledge all

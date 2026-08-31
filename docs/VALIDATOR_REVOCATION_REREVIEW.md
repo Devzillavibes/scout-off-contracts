@@ -69,7 +69,7 @@ This mirrors the `expire_trial_offers` bounded-sweep pattern in
 
 ## Off-chain schema
 
-`migrations/005_milestone_flags.sql` creates:
+`migrations/007_milestone_flags.sql` creates:
 
 - `milestone_flags` — one row per currently-flagged `(player_id, milestone_index)`.
 - `revocation_records` — one row per revoked validator, mirroring on-chain `RevocationRecord`.

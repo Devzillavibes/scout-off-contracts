@@ -57,7 +57,7 @@ against `progress.get_history_count` as a cheap drift signal.
 
 - ~~`scouts.verified`~~ — column added in migration `001_initial_schema.sql`
 - ~~Player deactivation status~~ — column added in migration `001_initial_schema.sql`
-- ~~Milestone pending-re-review flags~~ — `milestone_flags` and `revocation_records` tables added in migration `005_milestone_flags.sql` (issue #1039)
+- ~~Milestone pending-re-review flags~~ — `milestone_flags` and `revocation_records` tables added in migration `007_milestone_flags.sql` (issue #1039)
 # Indexer Reconciliation
 
 The backend event indexer mirrors on-chain state into PostgreSQL so the
