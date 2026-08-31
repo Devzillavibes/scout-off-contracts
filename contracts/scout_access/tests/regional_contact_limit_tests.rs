@@ -332,6 +332,91 @@ fn test_regional_override_does_not_affect_other_regions() {
 }
 
 #[test]
+fn test_renewal_resets_pro_contact_limit() {
+    let h = setup();
+    subscribe_pro(&h, &h.scout_na.clone());
+
+    // Use up the platform contact limit
+    for player_id in 1..=PLATFORM_LIMIT as u64 {
+        h.scout_access_client
+            .pay_to_contact(&h.scout_na, &player_id)
+            .unwrap();
+    }
+
+    // Attempting one more should fail
+    let over = h
+        .scout_access_client
+        .try_pay_to_contact(&h.scout_na, &(PLATFORM_LIMIT as u64 + 1));
+    assert!(over.is_err(), "contact limit should be reached before renewal");
+
+    // Advance to just after expiry (within the auto-renewal window)
+    let sub_duration = default_fees().sub_duration_secs;
+    let expiry = START_TS + sub_duration;
+    let late_secs = 2 * 60 * 60; // 2 hours late, well within 3-day window
+    h.env.ledger().with_mut(|l| l.timestamp = expiry + late_secs);
+
+    // Renewal should anchor to the old expiry and reset the contact limit
+    h.scout_access_client
+        .renew_if_due(&h.scout_na)
+        .expect("renewal should succeed");
+
+    // Contact limit should have reset: a new contact should succeed
+    let after_renewal = h
+        .scout_access_client
+        .try_pay_to_contact(&h.scout_na, &(PLATFORM_LIMIT as u64 + 2));
+    assert!(after_renewal.is_ok(), "renewal should reset the pro contact limit");
+}
+
+#[test]
+fn test_renew_if_due_anchors_to_prior_expiry_over_multiple_cycles() {
+    let h = setup();
+    subscribe_pro(&h, &h.scout_na.clone());
+
+    let sub_duration = default_fees().sub_duration_secs;
+    let late_secs = 2 * 60 * 60; // 2 hours late, within 3-day window
+    let start = START_TS;
+
+    // After the initial subscription, expiry is exactly one period out.
+    let mut expected_expiry = start + sub_duration;
+
+    // Simulate 12 late-but-in-window renewals.
+    for _ in 0..12 {
+        h.env.ledger().with_mut(|l| l.timestamp = expected_expiry + late_secs);
+        h.scout_access_client
+            .renew_if_due(&h.scout_na)
+            .expect("renewal should succeed within the grace window");
+
+        // If anchored correctly, the new expiry is exactly one period later.
+        expected_expiry += sub_duration;
+    }
+
+    // After 12 renewals, the final expiry should be start + 13 periods
+    // (initial subscription + 12 renewals). Drift would push it later.
+    let final_expiry = start + 13 * sub_duration;
+
+    // One second before the anchored expiry the subscription is still active.
+    h.env.ledger().with_mut(|l| l.timestamp = final_expiry - 1);
+    let before = h
+        .scout_access_client
+        .try_pay_to_contact(&h.scout_na, &999_998);
+    assert!(
+        before.is_ok(),
+        "subscription should be active just before the anchored expiry"
+    );
+
+    // At the anchored expiry the subscription lapses. A drift bug would make
+    // this still active because the expiry would have been shifted later.
+    h.env.ledger().with_mut(|l| l.timestamp = final_expiry);
+    let after = h
+        .scout_access_client
+        .try_pay_to_contact(&h.scout_na, &999_999);
+    assert!(
+        after.is_err(),
+        "subscription should expire at the anchored expiry, not later"
+    );
+}
+
+#[test]
 fn test_two_scouts_different_regional_limits() {
     let h = setup();
 
