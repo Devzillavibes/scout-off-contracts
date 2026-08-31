@@ -224,8 +224,6 @@ pub enum DataKey {
     ContactRecord(u64, Address),
     /// scout → Vec<u64> of contacted player_ids
     ScoutContacts(Address),
-    /// Monthly contact count for Pro tier: (scout, month_bucket) → count
-    ContactCount(Address, u64),
     /// trial offer counter per player
     TrialCounter(u64),
     /// (player_id, trial_index) → TrialOffer
