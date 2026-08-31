@@ -1,6 +1,6 @@
 # ScoutChain — AI Integration Guide
 
-> **Last reviewed:** 2026-07-24
+> **Last reviewed:** 2026-08-30
 > **Contract version:** see `version()` on each deployed contract
 > **Repo root:** `scout-off-contracts/`
 >
@@ -176,7 +176,13 @@ pub fn approve_milestone(
     player_id: u64,
     description: String,
     evidence_hash: String,
+    milestone_category: Option<String>,
 ) -> Result<u32, VerificationError>
+
+// `milestone_category` is optional but when supplied, the validator must hold the
+// matching specialization tag (returns `SpecializationMismatch` / code 21 otherwise).
+// `approve_milestone` is also gated by the threshold-mode check: calling it after
+// `set_milestone_threshold(n>=2)` returns `ThresholdModeRequiresAttestation`.
 
 pub fn dispute_milestone(
     env: Env,
@@ -293,6 +299,7 @@ pub fn confirm_trial_offer(
     player_wallet: Address,
     player_id: u64,
     index: u32,
+    idempotency_nonce: Option<String>,
 ) -> Result<(), ScoutAccessError>
 
 // Queries
