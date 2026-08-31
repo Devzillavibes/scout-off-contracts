@@ -6,6 +6,25 @@ functions in [CONTRACT_REFERENCE.md](CONTRACT_REFERENCE.md).
 
 ---
 
+## Affiliation / Diversity Config
+
+**Affiliation** is an admin-assigned canonical string identifier that records which organisation a validator belongs to (e.g. a club, academy, or certification body). It is distinct from the `credentials` display field: `credentials` is human-readable label text, while `affiliation` is a controlled identifier used for anti-collusion enforcement. Affiliation values are set and verified off-chain by the platform admin; the contract stores and enforces them but does not validate the real-world claim.
+
+**DiversityConfig** (set via `set_diversity_config`) configures a per-milestone-level requirement: advancing a player past a specified milestone level requires that at least N approvals came from validators with *distinct* affiliation values. This prevents a single organisation from monopolising advancement decisions even if it controls multiple registered validators.
+
+| Field | Meaning |
+|---|---|
+| `milestone_level` | The `ProgressLevel` at which the diversity rule activates |
+| `required_distinct_affiliations` | Minimum number of distinct validator affiliations among approvers |
+
+Key distinction from [Region Quorum](#region-quorum): Region Quorum enforces geographic spread among approvers; Affiliation / Diversity Config enforces organisational independence. The two mechanisms are complementary and can be active simultaneously.
+
+- The trust anchor for affiliation values is off-chain: the admin is responsible for assigning correct affiliation identifiers; the contract only enforces the count constraint.
+- See [docs/VALIDATOR_COLLUSION_THREAT_MODEL.md](VALIDATOR_COLLUSION_THREAT_MODEL.md) for the full threat model and the rationale for both mechanisms.
+- Related entry: [Region Quorum](#region-quorum).
+
+---
+
 ## CID (Content Identifier)
 
 A self-describing content hash produced by IPFS or Arweave. CIDs are stored
