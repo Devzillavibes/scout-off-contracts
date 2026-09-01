@@ -24,13 +24,18 @@ source .env.contracts
 
 ### One-command pause script
 
-Run ./scripts/emergency-pause.sh
+Run the emergency pause script:
 
-> **Note**: Each `pause_contract` call is a separate Stellar transaction.
+```bash
+./scripts/emergency-pause.sh
+```
+
+> **Note**: This requires `ADMIN_SECRET` and the contract IDs in `.env.contracts`
+> to be available first (see the prerequisites above).
+> Each `pause_contract` call is a separate Stellar transaction.
 > If the script exits mid-way (e.g. network error), run it again — the already-
 > paused contracts will return `ContractPaused` but will not change state.
 > Continue from the failed contract manually if needed.
-```
 
 ## Function-Scoped Circuit Breakers
 

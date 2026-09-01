@@ -61,7 +61,12 @@ const SKIPPED_TABLES = {
   player_level_history:
     "audit trail of advance/reset events; reconciled indirectly via the players.level check " +
     "and the per-player history count cross-check in the players section",
-  validator_history: "audit trail of restore/transfer events only; no single current-state getter to diff",
+  validator_history:
+    "audit trail of restore/transfer events only; no single current-state getter to diff. " +
+    "NOTE: revocation rows are populated from the 'validator_revoked' event — severity (routine " +
+    "vs. for-cause) is a data field, NOT a separate event name. There is no " +
+    "'validator_revoked_for_cause' event topic; subscribe to 'validator_revoked' and discriminate " +
+    "on the severity data field.",
   fee_config_history: "event-log only, by design (see docs commit clarifying this) — no per-row on-chain analog",
   admin_transfers: "event-log only across four contracts — no per-row on-chain analog",
 };
